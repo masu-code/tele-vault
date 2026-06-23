@@ -6,14 +6,25 @@ import 'package:tg/tg.dart' as tg;
 import '../config.dart';
 import 'io_socket.dart';
 
-// Known Telegram production DCs
-const _dcs = [
-  (id: 1, ip: '149.154.167.50', port: 443),
-  (id: 2, ip: '149.154.167.40', port: 443),
-  (id: 3, ip: '149.154.175.100', port: 443),
-  (id: 4, ip: '149.154.167.91', port: 443),
-  (id: 5, ip: '91.108.56.180', port: 443),
-];
+/// Seed IPs used only to bootstrap the very first connection, before the
+/// server's own data-center list is known. Production Telegram addresses; the
+/// authoritative list arrives in the Config from initConnection and takes over
+/// from there (see [_resolveDc]).
+const _seedDcs = {
+  1: (ip: '149.154.175.53', port: 443),
+  2: (ip: '149.154.167.51', port: 443),
+  3: (ip: '149.154.175.100', port: 443),
+  4: (ip: '149.154.167.91', port: 443),
+  5: (ip: '91.108.56.130', port: 443),
+};
+
+/// A saved session: which DC it belongs to plus the authorization key. The key
+/// is DC-specific, so the DC id must travel with it.
+class _Session {
+  final int dcId;
+  final tg.AuthorizationKey key;
+  const _Session(this.dcId, this.key);
+}
 
 class TelegramService {
   TelegramService._();
@@ -23,6 +34,10 @@ class TelegramService {
   IoSocket? _socket;
   int _dcId = 2;
 
+  /// DC list reported by the server. Preferred over [_seedDcs] when present,
+  /// since seed IPs can drift and only cover the common datacenters.
+  List<t.DcOption> _dcOptions = [];
+
   tg.Client get client {
     final c = _client;
     if (c == null) throw StateError('Not connected. Call connect() first.');
@@ -31,29 +46,43 @@ class TelegramService {
 
   bool get isConnected => _client != null;
 
-  Future<tg.Client> connect({int? dcId}) async {
-    _dcId = dcId ?? _dcId;
-    final dc = _dcs.firstWhere((d) => d.id == _dcId);
+  /// Resolves a DC id to an address, preferring the server-reported list.
+  ({String ip, int port}) _resolveDc(int dcId) {
+    for (final o in _dcOptions) {
+      if (o.id == dcId && !o.ipv6 && !o.cdn && !o.mediaOnly) {
+        return (ip: o.ipAddress, port: o.port);
+      }
+    }
+    final seed = _seedDcs[dcId];
+    if (seed == null) throw StateError('Unknown DC $dcId');
+    return seed;
+  }
 
-    final rawSocket = await Socket.connect(dc.ip, dc.port);
+  /// Connects to [dcId] (or the current DC). When [authKey] is supplied the
+  /// handshake is skipped and that key is reused (restored session).
+  Future<tg.Client> connect({int? dcId, tg.AuthorizationKey? authKey}) async {
+    _dcId = dcId ?? _dcId;
+    final dc = _resolveDc(_dcId);
+
+    final rawSocket = await Socket.connect(dc.ip, dc.port,
+        timeout: const Duration(seconds: 20));
     final ioSocket = IoSocket(rawSocket);
     final obfuscation = tg.Obfuscation.random(false, _dcId);
     final idGenerator = tg.MessageIdGenerator();
 
     await ioSocket.send(obfuscation.preamble);
 
-    final savedKey = await _loadKey();
-    final authKey = savedKey ??
-        await tg.Client.authorize(ioSocket, obfuscation, idGenerator);
+    final key =
+        authKey ?? await tg.Client.authorize(ioSocket, obfuscation, idGenerator);
 
     final client = tg.Client(
       socket: ioSocket,
       obfuscation: obfuscation,
-      authorizationKey: authKey,
+      authorizationKey: key,
       idGenerator: idGenerator,
     );
 
-    await client.initConnection<t.Config>(
+    final cfg = await client.initConnection<t.Config>(
       apiId: Config.apiId,
       deviceModel: 'TeleVault',
       systemVersion: Platform.operatingSystem,
@@ -63,6 +92,12 @@ class TelegramService {
       langCode: 'en',
       query: const t.HelpGetConfig(),
     );
+
+    // Capture the authoritative DC list so migrations land on the right server.
+    final config = cfg.result;
+    if (config is t.Config) {
+      _dcOptions = config.dcOptions.whereType<t.DcOption>().toList();
+    }
 
     _socket = ioSocket;
     _client = client;
@@ -76,12 +111,24 @@ class TelegramService {
     await connect(dcId: dcId);
   }
 
+  /// Restores a saved session, reconnecting to its DC with its key. Returns
+  /// false if there is nothing saved.
+  Future<bool> restoreSession() async {
+    final saved = await _loadSession();
+    if (saved == null) return false;
+    await connect(dcId: saved.dcId, authKey: saved.key);
+    return true;
+  }
+
   Future<void> saveSession() async {
     final c = _client;
     if (c == null) return;
     final dir = await getApplicationDocumentsDirectory();
-    await File('${dir.path}/tele_vault_session.json')
-        .writeAsString(c.authorizationKey.toString());
+    final data = jsonEncode({
+      'dcId': _dcId,
+      'key': c.authorizationKey.toJson(),
+    });
+    await File('${dir.path}/tele_vault_session.json').writeAsString(data);
   }
 
   Future<void> clearSession() async {
@@ -98,13 +145,14 @@ class TelegramService {
     return File('${dir.path}/tele_vault_session.json').exists();
   }
 
-  Future<tg.AuthorizationKey?> _loadKey() async {
+  Future<_Session?> _loadSession() async {
     try {
       final dir = await getApplicationDocumentsDirectory();
       final file = File('${dir.path}/tele_vault_session.json');
       if (!await file.exists()) return null;
-      final text = await file.readAsString();
-      return tg.AuthorizationKey.fromJson(jsonDecode(text) as Map<String, dynamic>);
+      final json = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      final key = tg.AuthorizationKey.fromJson(json['key'] as Map<String, dynamic>);
+      return _Session(json['dcId'] as int? ?? 2, key);
     } catch (_) {
       return null;
     }

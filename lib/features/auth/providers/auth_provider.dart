@@ -51,13 +51,11 @@ class AuthNotifier extends StateNotifier<AuthState> {
   Future<void> _init() async {
     state = state.copyWith(isLoading: true);
     try {
-      final hasSession = await TelegramService.instance.hasSession();
-      if (hasSession) {
-        await TelegramService.instance.connect();
-        state = state.copyWith(step: AuthStep.authenticated, isLoading: false);
-      } else {
-        state = state.copyWith(isLoading: false);
-      }
+      final restored = await TelegramService.instance.restoreSession();
+      state = state.copyWith(
+        step: restored ? AuthStep.authenticated : AuthStep.initial,
+        isLoading: false,
+      );
     } catch (_) {
       await TelegramService.instance.clearSession();
       state = state.copyWith(isLoading: false);
@@ -160,7 +158,12 @@ class AuthNotifier extends StateNotifier<AuthState> {
     state = state.copyWith(isLoading: true, error: null);
     try {
       final client = TelegramService.instance.client;
-      final srp = await tg.check2FA(state.accountPassword!, password);
+      // SRP params (srp_id / srp_B) are single-use and time-limited, so fetch
+      // them fresh for each attempt. Reusing the ones from signIn — which may
+      // have expired while the user typed — yields SRP_ID_INVALID.
+      final passResult = await client.account.getPassword();
+      final accountPassword = passResult.result as t.AccountPassword;
+      final srp = await tg.check2FA(accountPassword, password);
       final result = await client.auth.checkPassword(password: srp);
 
       if (result.error != null) {
