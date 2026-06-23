@@ -2,11 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../download/providers/download_provider.dart';
 import '../../upload/providers/upload_provider.dart';
+import '../../../models/folder.dart';
 import '../providers/index_provider.dart';
 
-/// Minimal explorer wired to the Telegram-backed index. Phase 3 expands this
-/// into the full file browser; for now it proves the index round-trips: it
-/// loads on entry and folder create/delete writes back to Saved Messages.
+/// File browser backed by the Telegram index. Supports navigating into folders;
+/// uploads and new folders are created inside the folder currently open.
 class ExplorerScreen extends ConsumerStatefulWidget {
   const ExplorerScreen({super.key});
 
@@ -15,14 +15,22 @@ class ExplorerScreen extends ConsumerStatefulWidget {
 }
 
 class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
+  /// Stack of folders from root to the one currently open. Empty = root.
+  final List<Folder> _path = [];
+
+  String? get _currentFolderId => _path.isEmpty ? null : _path.last.id;
+
   @override
   void initState() {
     super.initState();
-    // Load the index once the screen is shown (user is authenticated here).
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(indexProvider.notifier).load();
     });
   }
+
+  void _openFolder(Folder folder) => setState(() => _path.add(folder));
+
+  void _goUp() => setState(() => _path.removeLast());
 
   Future<void> _createFolderDialog() async {
     final controller = TextEditingController();
@@ -46,7 +54,7 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
       ),
     );
     if (name != null && name.isNotEmpty) {
-      await ref.read(indexProvider.notifier).createFolder(name);
+      await ref.read(indexProvider.notifier).createFolder(name, parentId: _currentFolderId);
     }
   }
 
@@ -54,10 +62,9 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
   Widget build(BuildContext context) {
     final state = ref.watch(indexProvider);
     final upload = ref.watch(uploadProvider);
-    final folders = state.index.foldersIn(null);
-    final files = state.index.filesIn(null);
-
     final download = ref.watch(downloadProvider);
+    final folders = state.index.foldersIn(_currentFolderId);
+    final files = state.index.filesIn(_currentFolderId);
 
     ref.listen(uploadProvider, (prev, next) {
       if (next.error != null && next.error != prev?.error) {
@@ -74,9 +81,12 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
       }
     });
 
+    final atRoot = _path.isEmpty;
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('TeleVault'),
+        leading: atRoot ? null : IconButton(icon: const Icon(Icons.arrow_back), onPressed: _goUp),
+        title: Text(atRoot ? 'TeleVault' : _path.last.name),
         actions: [
           if (state.isSaving)
             const Padding(
@@ -106,7 +116,7 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
             heroTag: 'upload',
             onPressed: upload.isUploading
                 ? null
-                : () => ref.read(uploadProvider.notifier).pickAndUpload(),
+                : () => ref.read(uploadProvider.notifier).pickAndUpload(folderId: _currentFolderId),
             icon: const Icon(Icons.upload_file),
             label: const Text('Upload'),
           ),
@@ -114,9 +124,22 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
       ),
       body: Column(
         children: [
+          if (!atRoot) _breadcrumb(),
           if (upload.isUploading) _uploadBanner(upload),
           Expanded(child: _buildBody(state, download, folders, files)),
         ],
+      ),
+    );
+  }
+
+  Widget _breadcrumb() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      color: const Color(0xFF14303F),
+      child: Text(
+        'Root / ${_path.map((f) => f.name).join(' / ')}',
+        style: const TextStyle(fontSize: 12, color: Colors.white70),
       ),
     );
   }
@@ -163,7 +186,7 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
     }
     if (folders.isEmpty && files.isEmpty) {
       return const Center(
-        child: Text('Empty vault.\nTap + to create a folder.',
+        child: Text('Empty folder.\nTap + to create a folder or Upload a file.',
             textAlign: TextAlign.center, style: TextStyle(color: Colors.white54)),
       );
     }
@@ -173,6 +196,7 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
           ListTile(
             leading: const Icon(Icons.folder, color: Color(0xFF2AABEE)),
             title: Text(folder.name),
+            onTap: () => _openFolder(folder),
             trailing: IconButton(
               icon: const Icon(Icons.delete_outline),
               onPressed: () => ref.read(indexProvider.notifier).removeFolder(folder.id),
