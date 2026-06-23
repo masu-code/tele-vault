@@ -46,7 +46,7 @@ class IndexService {
       throw IndexException('Failed to read history: ${result.error!.errorMessage}');
     }
 
-    final messages = _extractMessages(result.result);
+    final messages = extractMessages(result.result);
     for (final msg in messages) {
       if (msg is t.Message && msg.message.startsWith(_marker)) {
         _messageId = msg.id;
@@ -119,16 +119,6 @@ class IndexService {
     }
 
     _messageId = extractSentMessageId(result.result, randomId);
-  }
-
-  /// Pulls the message list out of the various MessagesMessages* containers.
-  List<t.MessageBase> _extractMessages(t.MessagesMessagesBase? base) {
-    return switch (base) {
-      t.MessagesMessages(:final messages) => messages,
-      t.MessagesMessagesSlice(:final messages) => messages,
-      t.MessagesChannelMessages(:final messages) => messages,
-      _ => const [],
-    };
   }
 
 }

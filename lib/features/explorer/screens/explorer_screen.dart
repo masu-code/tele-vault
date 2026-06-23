@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../download/providers/download_provider.dart';
 import '../../upload/providers/upload_provider.dart';
 import '../providers/index_provider.dart';
 
@@ -56,10 +57,19 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
     final folders = state.index.foldersIn(null);
     final files = state.index.filesIn(null);
 
+    final download = ref.watch(downloadProvider);
+
     ref.listen(uploadProvider, (prev, next) {
       if (next.error != null && next.error != prev?.error) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Upload failed: ${next.error}')),
+        );
+      }
+    });
+    ref.listen(downloadProvider, (prev, next) {
+      if (next.error != null && next.error != prev?.error) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Download failed: ${next.error}')),
         );
       }
     });
@@ -105,7 +115,7 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
       body: Column(
         children: [
           if (upload.isUploading) _uploadBanner(upload),
-          Expanded(child: _buildBody(state, folders, files)),
+          Expanded(child: _buildBody(state, download, folders, files)),
         ],
       ),
     );
@@ -131,7 +141,8 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
     );
   }
 
-  Widget _buildBody(IndexState state, List folders, List files) {
+  Widget _buildBody(
+      IndexState state, DownloadState download, List folders, List files) {
     if (state.isLoading) {
       return const Center(child: CircularProgressIndicator());
     }
@@ -171,9 +182,35 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
           ListTile(
             leading: const Icon(Icons.insert_drive_file_outlined),
             title: Text(file.name),
-            subtitle: Text('${file.parts.length} part(s) · ${file.totalSize} B'),
+            subtitle: Text('${file.parts.length} part(s) · ${_humanSize(file.totalSize)}'),
+            trailing: download.fileId == file.id
+                ? SizedBox(
+                    width: 32,
+                    height: 32,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      value: download.progress == 0 ? null : download.progress,
+                    ),
+                  )
+                : IconButton(
+                    icon: const Icon(Icons.download_outlined),
+                    onPressed: download.isDownloading
+                        ? null
+                        : () => ref.read(downloadProvider.notifier).downloadAndOpen(file),
+                  ),
           ),
       ],
     );
+  }
+
+  static String _humanSize(int bytes) {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    var size = bytes.toDouble();
+    var unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+      size /= 1024;
+      unit++;
+    }
+    return '${size.toStringAsFixed(unit == 0 ? 0 : 1)} ${units[unit]}';
   }
 }

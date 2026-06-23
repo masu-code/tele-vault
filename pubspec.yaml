@@ -42,6 +42,7 @@ dependencies:
   uuid: ^4.5.0
   mime: ^2.0.0
   file_picker: ^8.1.0
+  open_filex: ^4.5.0
 
 dev_dependencies:
   flutter_test:

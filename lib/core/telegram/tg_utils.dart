@@ -24,3 +24,11 @@ int? extractSentMessageId(t.UpdatesBase? updates, int randomId) {
   }
   return null;
 }
+
+/// Pulls the message list out of the various MessagesMessages* containers.
+List<t.MessageBase> extractMessages(t.MessagesMessagesBase? base) => switch (base) {
+      t.MessagesMessages(:final messages) => messages,
+      t.MessagesMessagesSlice(:final messages) => messages,
+      t.MessagesChannelMessages(:final messages) => messages,
+      _ => const [],
+    };
