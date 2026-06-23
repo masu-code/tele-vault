@@ -1,7 +1,7 @@
-import 'dart:math';
 import 'package:t/t.dart' as t;
 import '../../models/file_index.dart';
 import '../telegram/client.dart';
+import '../telegram/tg_utils.dart';
 
 /// Reads and writes the vault index to the user's Telegram "Saved Messages".
 ///
@@ -19,8 +19,6 @@ class IndexService {
 
   static const String _marker = 'TELEVAULT_INDEX_V1';
   static const int _maxMessageLength = 4096;
-
-  final _random = Random.secure();
 
   /// Telegram message id of the index message, once known. Cached so updates
   /// can edit in place instead of posting a new message.
@@ -101,7 +99,7 @@ class IndexService {
   }
 
   Future<void> _create(String body) async {
-    final randomId = _randomId();
+    final randomId = randomInt64();
     final result = await _client.messages.sendMessage(
       noWebpage: true,
       silent: true,
@@ -120,7 +118,7 @@ class IndexService {
       throw IndexException('Failed to write index: ${result.error!.errorMessage}');
     }
 
-    _messageId = _extractSentMessageId(result.result, randomId);
+    _messageId = extractSentMessageId(result.result, randomId);
   }
 
   /// Pulls the message list out of the various MessagesMessages* containers.
@@ -133,24 +131,6 @@ class IndexService {
     };
   }
 
-  /// Finds the new message's id via the UpdateMessageID echo of our randomId.
-  int? _extractSentMessageId(t.UpdatesBase? updates, int randomId) {
-    final list = switch (updates) {
-      t.Updates(:final updates) => updates,
-      t.UpdatesCombined(:final updates) => updates,
-      _ => const <t.UpdateBase>[],
-    };
-    for (final u in list) {
-      if (u is t.UpdateMessageID && u.randomId == randomId) return u.id;
-    }
-    return null;
-  }
-
-  int _randomId() {
-    final hi = _random.nextInt(1 << 32);
-    final lo = _random.nextInt(1 << 32);
-    return (hi << 32) | lo;
-  }
 }
 
 class IndexException implements Exception {

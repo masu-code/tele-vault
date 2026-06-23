@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../upload/providers/upload_provider.dart';
 import '../providers/index_provider.dart';
 
 /// Minimal explorer wired to the Telegram-backed index. Phase 3 expands this
@@ -51,8 +52,17 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(indexProvider);
+    final upload = ref.watch(uploadProvider);
     final folders = state.index.foldersIn(null);
     final files = state.index.filesIn(null);
+
+    ref.listen(uploadProvider, (prev, next) {
+      if (next.error != null && next.error != prev?.error) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Upload failed: ${next.error}')),
+        );
+      }
+    });
 
     return Scaffold(
       appBar: AppBar(
@@ -72,11 +82,52 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _createFolderDialog,
-        child: const Icon(Icons.create_new_folder_outlined),
+      floatingActionButton: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          FloatingActionButton.small(
+            heroTag: 'newFolder',
+            onPressed: _createFolderDialog,
+            child: const Icon(Icons.create_new_folder_outlined),
+          ),
+          const SizedBox(height: 12),
+          FloatingActionButton.extended(
+            heroTag: 'upload',
+            onPressed: upload.isUploading
+                ? null
+                : () => ref.read(uploadProvider.notifier).pickAndUpload(),
+            icon: const Icon(Icons.upload_file),
+            label: const Text('Upload'),
+          ),
+        ],
       ),
-      body: _buildBody(state, folders, files),
+      body: Column(
+        children: [
+          if (upload.isUploading) _uploadBanner(upload),
+          Expanded(child: _buildBody(state, folders, files)),
+        ],
+      ),
+    );
+  }
+
+  Widget _uploadBanner(UploadState upload) {
+    return Material(
+      color: const Color(0xFF14303F),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Uploading ${upload.fileName ?? ''}  ${(upload.progress * 100).toStringAsFixed(0)}%',
+              style: const TextStyle(fontSize: 12),
+            ),
+            const SizedBox(height: 6),
+            LinearProgressIndicator(value: upload.progress == 0 ? null : upload.progress),
+          ],
+        ),
+      ),
     );
   }
 
