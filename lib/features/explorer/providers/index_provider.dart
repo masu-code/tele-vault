@@ -43,8 +43,14 @@ class IndexNotifier extends StateNotifier<IndexState> {
     try {
       final index = await IndexService.instance.load();
       state = state.copyWith(index: index, isLoading: false);
+      // One-time upgrade from a legacy text-message index to a document.
+      if (IndexService.instance.needsMigration) {
+        state = state.copyWith(isSaving: true);
+        await IndexService.instance.save(index);
+        state = state.copyWith(isSaving: false);
+      }
     } catch (e) {
-      state = state.copyWith(isLoading: false, error: e.toString());
+      state = state.copyWith(isLoading: false, isSaving: false, error: e.toString());
     }
   }
 

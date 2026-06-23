@@ -1,35 +1,47 @@
+import 'dart:convert';
+import 'dart:typed_data';
 import 'package:t/t.dart' as t;
 import '../../models/file_index.dart';
+import '../download/download_plan.dart';
 import '../telegram/client.dart';
 import '../telegram/tg_utils.dart';
+import '../upload/upload_plan.dart';
 
 /// Reads and writes the vault index to the user's Telegram "Saved Messages".
 ///
-/// The index lives in a single self-chat message, tagged with [_marker] so it
-/// can be found again on any device. The first line is the marker; the rest is
-/// the JSON payload.
+/// The index is stored as an uploaded JSON document (`televault_index.json`)
+/// whose message caption is [_marker], so it can be found again on any device.
+/// Storing it as a document — rather than a plain text message — removes the
+/// 4096-character cap a text message would impose, letting the index hold
+/// effectively unlimited entries.
 ///
-/// LIMITATION: Telegram text messages cap at 4096 UTF-16 code units, which
-/// bounds how many entries fit here (~20-40 files). Phase 3 will migrate the
-/// index to an uploaded JSON document to remove this ceiling. The public API
-/// of this service is kept storage-agnostic so that swap stays internal.
+/// Backward compatible: an older text-message index (caption starts with
+/// [_marker], no media) is read and then rewritten as a document on the next
+/// save, and the stale text message is deleted.
 class IndexService {
   IndexService._();
   static final IndexService instance = IndexService._();
 
   static const String _marker = 'TELEVAULT_INDEX_V1';
-  static const int _maxMessageLength = 4096;
+  static const String _fileName = 'televault_index.json';
 
-  /// Telegram message id of the index message, once known. Cached so updates
-  /// can edit in place instead of posting a new message.
+  /// Message id of the current index message, once known.
   int? _messageId;
+
+  /// True when [_messageId] points at a legacy text message that must be
+  /// replaced (not edited) by a document on the next save.
+  bool _legacy = false;
 
   int? get messageId => _messageId;
 
+  /// True after [load] reads a legacy text-message index, signalling the caller
+  /// to persist once so it gets rewritten as a document.
+  bool get needsMigration => _legacy;
+
   t.Client get _client => TelegramService.instance.client;
 
-  /// Loads the index from Saved Messages, scanning recent history for the
-  /// tagged message. Returns an empty index if none exists yet.
+  /// Loads the index, scanning recent Saved Messages for the tagged message.
+  /// Returns an empty index if none exists yet.
   Future<FileIndex> load() async {
     final result = await _client.messages.getHistory(
       peer: const t.InputPeerSelf(),
@@ -41,67 +53,78 @@ class IndexService {
       minId: 0,
       hash: 0,
     );
-
     if (result.error != null) {
       throw IndexException('Failed to read history: ${result.error!.errorMessage}');
     }
 
-    final messages = extractMessages(result.result);
-    for (final msg in messages) {
-      if (msg is t.Message && msg.message.startsWith(_marker)) {
+    for (final msg in extractMessages(result.result)) {
+      if (msg is! t.Message || !msg.message.startsWith(_marker)) continue;
+
+      final media = msg.media;
+      if (media is t.MessageMediaDocument && media.document is t.Document) {
+        // Current format: index stored as a document.
         _messageId = msg.id;
+        _legacy = false;
+        final bytes = await _downloadDocument(media.document as t.Document);
+        final raw = utf8.decode(bytes);
+        try {
+          return FileIndex.decode(raw);
+        } catch (e) {
+          throw IndexException('Index document is corrupt: $e');
+        }
+      } else {
+        // Legacy format: JSON inline after the marker in a text message.
+        _messageId = msg.id;
+        _legacy = true;
         final payload = msg.message.substring(_marker.length).trimLeft();
         if (payload.isEmpty) return FileIndex.empty();
         try {
           return FileIndex.decode(payload);
         } catch (e) {
-          throw IndexException('Index message is corrupt: $e');
+          throw IndexException('Legacy index message is corrupt: $e');
         }
       }
     }
 
-    // No index yet on this account.
     _messageId = null;
+    _legacy = false;
     return FileIndex.empty();
   }
 
-  /// Persists [index] to Saved Messages. Edits the existing index message when
-  /// one is known, otherwise creates it.
+  /// Persists [index] as a JSON document. Edits the existing index document in
+  /// place when possible; otherwise uploads a new one and removes any stale
+  /// (or legacy) index message.
   Future<void> save(FileIndex index) async {
-    final body = '$_marker\n${index.encode()}';
+    final bytes = Uint8List.fromList(utf8.encode(index.encode()));
+    final inputFile = await _uploadBytes(bytes, _fileName);
+    final media = t.InputMediaUploadedDocument(
+      nosoundVideo: false,
+      forceFile: true,
+      spoiler: false,
+      file: inputFile,
+      mimeType: 'application/json',
+      attributes: [const t.DocumentAttributeFilename(fileName: _fileName)],
+    );
 
-    if (body.length > _maxMessageLength) {
-      throw IndexException(
-        'Index exceeds the $_maxMessageLength-char message limit '
-        '(${body.length}). Document-backed storage lands in Phase 3.',
-      );
-    }
-
-    final id = _messageId;
-    if (id != null) {
+    // Edit the existing document message in place when we have one.
+    if (_messageId != null && !_legacy) {
       final result = await _client.messages.editMessage(
         noWebpage: true,
         invertMedia: false,
         peer: const t.InputPeerSelf(),
-        id: id,
-        message: body,
+        id: _messageId!,
+        message: _marker,
+        media: media,
       );
-      if (result.error != null) {
-        // The message may have been deleted on another device; fall back to
-        // creating a fresh one.
-        _messageId = null;
-        await _create(body);
-      }
-      return;
+      if (result.error == null) return;
+      // The message may be gone; fall through to create a fresh one.
+      _messageId = null;
     }
 
-    await _create(body);
-  }
-
-  Future<void> _create(String body) async {
+    // Create a new index document.
+    final staleId = _messageId; // legacy text message to clean up, if any
     final randomId = randomInt64();
-    final result = await _client.messages.sendMessage(
-      noWebpage: true,
+    final result = await _client.messages.sendMedia(
       silent: true,
       background: false,
       clearDraft: false,
@@ -110,17 +133,78 @@ class IndexService {
       invertMedia: false,
       allowPaidFloodskip: false,
       peer: const t.InputPeerSelf(),
-      message: body,
+      media: media,
+      message: _marker,
       randomId: randomId,
     );
-
     if (result.error != null) {
       throw IndexException('Failed to write index: ${result.error!.errorMessage}');
     }
-
     _messageId = extractSentMessageId(result.result, randomId);
+    _legacy = false;
+
+    // Remove the superseded legacy text message so load() won't see two.
+    if (staleId != null) {
+      await _client.messages.deleteMessages(revoke: false, id: [staleId]);
+    }
   }
 
+  /// Uploads [bytes] as document parts and returns the InputFile reference.
+  /// The index is small enough to use the regular (non-big) upload path.
+  Future<t.InputFile> _uploadBytes(Uint8List bytes, String name) async {
+    final fileId = randomInt64();
+    const chunkSize = UploadLimits.chunkSize;
+    final totalParts = (bytes.length + chunkSize - 1) ~/ chunkSize;
+
+    for (var part = 0; part < totalParts; part++) {
+      final start = part * chunkSize;
+      final end = (start + chunkSize) < bytes.length ? start + chunkSize : bytes.length;
+      final result = await _client.upload.saveFilePart(
+        fileId: fileId,
+        filePart: part,
+        bytes: Uint8List.sublistView(bytes, start, end),
+      );
+      if (result.error != null) {
+        throw IndexException('Index upload failed at part $part: ${result.error!.errorMessage}');
+      }
+    }
+
+    return t.InputFile(
+      id: fileId,
+      parts: totalParts == 0 ? 1 : totalParts,
+      name: name,
+      md5Checksum: '',
+    );
+  }
+
+  Future<Uint8List> _downloadDocument(t.Document doc) async {
+    final location = t.InputDocumentFileLocation(
+      id: doc.id,
+      accessHash: doc.accessHash,
+      fileReference: doc.fileReference,
+      thumbSize: '',
+    );
+    final builder = BytesBuilder();
+    for (final range in downloadRanges(doc.size)) {
+      final result = await _client.upload.getFile(
+        precise: false,
+        cdnSupported: false,
+        location: location,
+        offset: range.offset,
+        limit: range.limit,
+      );
+      if (result.error != null) {
+        throw IndexException('Index download failed: ${result.error!.errorMessage}');
+      }
+      final file = result.result;
+      if (file is! t.UploadFile) {
+        throw IndexException('Unexpected getFile response for index.');
+      }
+      builder.add(file.bytes);
+      if (file.bytes.length < range.limit) break;
+    }
+    return builder.toBytes();
+  }
 }
 
 class IndexException implements Exception {
