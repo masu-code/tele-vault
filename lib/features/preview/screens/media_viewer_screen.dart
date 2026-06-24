@@ -1,12 +1,25 @@
 import 'dart:io';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import '../../../core/download/download_service.dart';
 import '../../../models/file_item.dart';
 
-/// Full-screen media viewer with horizontal swipe between items. Images zoom
-/// and pan; videos play with media_kit. Used by the gallery and albums.
+/// Lets a PageView be dragged with a mouse (desktop), not just touch.
+class _DragScrollBehavior extends MaterialScrollBehavior {
+  @override
+  Set<PointerDeviceKind> get dragDevices => {
+        PointerDeviceKind.touch,
+        PointerDeviceKind.mouse,
+        PointerDeviceKind.trackpad,
+        PointerDeviceKind.stylus,
+      };
+}
+
+/// Full-screen media viewer with swipe (touch + mouse drag), side arrows, and
+/// keyboard ←/→ navigation. Images zoom and pan; videos play with media_kit.
 class MediaViewerScreen extends StatefulWidget {
   const MediaViewerScreen({super.key, required this.items, required this.initialIndex});
 
@@ -19,12 +32,30 @@ class MediaViewerScreen extends StatefulWidget {
 
 class _MediaViewerScreenState extends State<MediaViewerScreen> {
   late final PageController _controller = PageController(initialPage: widget.initialIndex);
+  final FocusNode _focus = FocusNode();
   late int _current = widget.initialIndex;
 
   @override
   void dispose() {
     _controller.dispose();
+    _focus.dispose();
     super.dispose();
+  }
+
+  void _go(int delta) {
+    final target = (_current + delta).clamp(0, widget.items.length - 1);
+    if (target == _current) return;
+    _controller.animateToPage(
+      target,
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOut,
+    );
+  }
+
+  void _onKey(KeyEvent event) {
+    if (event is! KeyDownEvent) return;
+    if (event.logicalKey == LogicalKeyboardKey.arrowLeft) _go(-1);
+    if (event.logicalKey == LogicalKeyboardKey.arrowRight) _go(1);
   }
 
   @override
@@ -34,18 +65,60 @@ class _MediaViewerScreenState extends State<MediaViewerScreen> {
       backgroundColor: Colors.black,
       appBar: AppBar(
         backgroundColor: Colors.black,
-        title: Text(item.name, style: const TextStyle(fontSize: 16)),
+        title: Text('${item.name}  (${_current + 1}/${widget.items.length})',
+            style: const TextStyle(fontSize: 16)),
       ),
-      body: PageView.builder(
-        controller: _controller,
-        itemCount: widget.items.length,
-        onPageChanged: (i) => setState(() => _current = i),
-        itemBuilder: (context, i) {
-          final media = widget.items[i];
-          return media.mimeType.startsWith('video/')
-              ? _VideoPage(key: ValueKey(media.id), file: media)
-              : _ImagePage(key: ValueKey(media.id), file: media);
-        },
+      body: KeyboardListener(
+        focusNode: _focus,
+        autofocus: true,
+        onKeyEvent: _onKey,
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            ScrollConfiguration(
+              behavior: _DragScrollBehavior(),
+              child: PageView.builder(
+                controller: _controller,
+                itemCount: widget.items.length,
+                onPageChanged: (i) => setState(() => _current = i),
+                itemBuilder: (context, i) {
+                  final media = widget.items[i];
+                  return media.mimeType.startsWith('video/')
+                      ? _VideoPage(key: ValueKey(media.id), file: media)
+                      : _ImagePage(key: ValueKey(media.id), file: media);
+                },
+              ),
+            ),
+            if (_current > 0)
+              Positioned(
+                left: 8,
+                child: _NavArrow(icon: Icons.chevron_left, onTap: () => _go(-1)),
+              ),
+            if (_current < widget.items.length - 1)
+              Positioned(
+                right: 8,
+                child: _NavArrow(icon: Icons.chevron_right, onTap: () => _go(1)),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _NavArrow extends StatelessWidget {
+  const _NavArrow({required this.icon, required this.onTap});
+  final IconData icon;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black38,
+      shape: const CircleBorder(),
+      child: IconButton(
+        icon: Icon(icon, color: Colors.white, size: 32),
+        onPressed: onTap,
       ),
     );
   }

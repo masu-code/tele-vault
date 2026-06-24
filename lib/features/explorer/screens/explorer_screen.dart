@@ -1,16 +1,26 @@
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../download/providers/download_provider.dart';
 import '../../preview/screens/image_preview_screen.dart';
 import '../../preview/screens/video_preview_screen.dart';
 import '../../upload/providers/upload_provider.dart';
+import '../../../models/file_index.dart';
 import '../../../models/file_item.dart';
 import '../../../models/folder.dart';
 import '../providers/index_provider.dart';
 import '../widgets/file_thumbnail.dart';
+import '../widgets/save_to_device_button.dart';
 
-/// File browser backed by the Telegram index. Supports navigating into folders;
-/// uploads and new folders are created inside the folder currently open.
+/// A move destination chosen by the user. `null` return from the picker means
+/// cancelled; a [_MoveTarget] with a null [folderId] means the root.
+class _MoveTarget {
+  final String? folderId;
+  const _MoveTarget(this.folderId);
+}
+
+/// Full file manager: navigate folders, upload (picker + drag-drop), and a
+/// multi-select mode with move / rename / save-to-device / delete.
 class ExplorerScreen extends ConsumerStatefulWidget {
   const ExplorerScreen({super.key});
 
@@ -22,14 +32,33 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
   /// Stack of folders from root to the one currently open. Empty = root.
   final List<Folder> _path = [];
 
+  final Set<String> _selFiles = {};
+  final Set<String> _selFolders = {};
+  bool _selecting = false;
+
   String? get _currentFolderId => _path.isEmpty ? null : _path.last.id;
+  int get _selCount => _selFiles.length + _selFolders.length;
 
   void _openFolder(Folder folder) => setState(() => _path.add(folder));
-
   void _goUp() => setState(() => _path.removeLast());
 
-  /// Images and videos preview in-app; everything else is downloaded and
-  /// handed to the device's default handler.
+  void _exitSelection() => setState(() {
+        _selecting = false;
+        _selFiles.clear();
+        _selFolders.clear();
+      });
+
+  void _toggleFile(FileItem f) => setState(() {
+        if (!_selFiles.remove(f.id)) _selFiles.add(f.id);
+        _selecting = _selCount > 0;
+      });
+
+  void _toggleFolder(Folder f) => setState(() {
+        if (!_selFolders.remove(f.id)) _selFolders.add(f.id);
+        _selecting = _selCount > 0;
+      });
+
+  /// Images and videos preview in-app; everything else opens with the system.
   void _openFile(FileItem file) {
     final mime = file.mimeType;
     if (mime.startsWith('image/')) {
@@ -41,43 +70,148 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
         MaterialPageRoute(builder: (_) => VideoPreviewScreen(file: file)),
       );
     } else {
-      ref.read(downloadProvider.notifier).downloadAndOpen(file);
+      ref.read(downloadProvider.notifier).openWithSystem(file);
     }
   }
 
-  Future<void> _createFolderDialog() async {
-    final controller = TextEditingController();
-    final name = await showDialog<String>(
+  Future<String?> _promptName(String title, {String initial = ''}) {
+    final controller = TextEditingController(text: initial);
+    return showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('New folder'),
+        title: Text(title),
         content: TextField(
           controller: controller,
           autofocus: true,
-          decoration: const InputDecoration(hintText: 'Folder name'),
+          decoration: const InputDecoration(hintText: 'Name'),
           onSubmitted: (v) => Navigator.of(ctx).pop(v.trim()),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
           FilledButton(
             onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
-            child: const Text('Create'),
+            child: const Text('OK'),
           ),
         ],
       ),
     );
+  }
+
+  Future<void> _createFolderDialog() async {
+    final name = await _promptName('New folder');
     if (name != null && name.isNotEmpty) {
       await ref.read(indexProvider.notifier).createFolder(name, parentId: _currentFolderId);
     }
+  }
+
+  Future<void> _renameSelected(FileIndex index) async {
+    if (_selFiles.length == 1 && _selFolders.isEmpty) {
+      final file = index.files.firstWhere((f) => f.id == _selFiles.first);
+      final name = await _promptName('Rename file', initial: file.name);
+      if (name != null && name.isNotEmpty) {
+        await ref.read(indexProvider.notifier).renameFile(file.id, name);
+      }
+    } else if (_selFolders.length == 1 && _selFiles.isEmpty) {
+      final folder = index.folders.firstWhere((f) => f.id == _selFolders.first);
+      final name = await _promptName('Rename folder', initial: folder.name);
+      if (name != null && name.isNotEmpty) {
+        await ref.read(indexProvider.notifier).renameFolder(folder.id, name);
+      }
+    }
+    _exitSelection();
+  }
+
+  Future<void> _moveSelected(FileIndex index) async {
+    // Can't move a folder into itself or its own subtree.
+    final excluded = <String>{..._selFolders};
+    for (final fid in _selFolders) {
+      excluded.addAll(index.descendantFolderIds(fid));
+    }
+    final candidates =
+        index.folders.where((f) => !excluded.contains(f.id)).toList();
+    final byId = {for (final f in index.folders) f.id: f};
+
+    String pathOf(Folder f) {
+      final names = <String>[];
+      Folder? cur = f;
+      while (cur != null) {
+        names.insert(0, cur.name);
+        cur = cur.parentId == null ? null : byId[cur.parentId];
+      }
+      return names.join(' / ');
+    }
+
+    final target = await showModalBottomSheet<_MoveTarget>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text('Move to…', style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+            ListTile(
+              leading: const Icon(Icons.home_outlined),
+              title: const Text('Root'),
+              onTap: () => Navigator.pop(ctx, const _MoveTarget(null)),
+            ),
+            for (final f in candidates)
+              ListTile(
+                leading: const Icon(Icons.folder_outlined),
+                title: Text(pathOf(f)),
+                onTap: () => Navigator.pop(ctx, _MoveTarget(f.id)),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (target == null) return;
+    await ref
+        .read(indexProvider.notifier)
+        .moveItems(_selFiles.toList(), _selFolders.toList(), target.folderId);
+    _exitSelection();
+  }
+
+  Future<void> _saveSelected(FileIndex index) async {
+    final files = index.files.where((f) => _selFiles.contains(f.id)).toList();
+    _exitSelection();
+    await ref.read(downloadProvider.notifier).saveManyToDevice(files);
+  }
+
+  Future<void> _deleteSelected(FileIndex index) async {
+    final files = index.files.where((f) => _selFiles.contains(f.id)).toList();
+    final folderIds = _selFolders.toList();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete $_selCount item(s)?'),
+        content: const Text(
+          'Files are permanently removed from Telegram. Folders are removed and '
+          'their contents moved to the root. This cannot be undone.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await ref.read(indexProvider.notifier).deleteItems(files, folderIds);
+    _exitSelection();
   }
 
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(indexProvider);
     final upload = ref.watch(uploadProvider);
-    final download = ref.watch(downloadProvider);
-    final folders = state.index.foldersIn(_currentFolderId);
-    final files = state.index.filesIn(_currentFolderId);
+    final index = state.index;
+    final folders = index.foldersIn(_currentFolderId);
+    final files = index.filesIn(_currentFolderId);
 
     ref.listen(uploadProvider, (prev, next) {
       if (next.error != null && next.error != prev?.error) {
@@ -88,60 +222,100 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
     });
     ref.listen(downloadProvider, (prev, next) {
       if (next.error != null && next.error != prev?.error) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Download failed: ${next.error}')),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed: ${next.error}')));
+      }
+      if (next.savedMessage != null && next.savedMessage != prev?.savedMessage) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(next.savedMessage!)));
       }
     });
 
-    final atRoot = _path.isEmpty;
-
     return Scaffold(
-      appBar: AppBar(
-        leading: atRoot ? null : IconButton(icon: const Icon(Icons.arrow_back), onPressed: _goUp),
-        title: Text(atRoot ? 'TeleVault' : _path.last.name),
-        actions: [
-          if (state.isSaving)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: SizedBox(
-                width: 18, height: 18,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
+      appBar: _selecting ? _selectionAppBar(index) : _normalAppBar(state),
+      floatingActionButton: _selecting
+          ? null
+          : Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                FloatingActionButton.small(
+                  heroTag: 'newFolder',
+                  onPressed: _createFolderDialog,
+                  child: const Icon(Icons.create_new_folder_outlined),
+                ),
+                const SizedBox(height: 12),
+                FloatingActionButton.extended(
+                  heroTag: 'upload',
+                  onPressed: upload.isUploading
+                      ? null
+                      : () => ref.read(uploadProvider.notifier).pickAndUpload(folderId: _currentFolderId),
+                  icon: const Icon(Icons.upload_file),
+                  label: const Text('Upload'),
+                ),
+              ],
             ),
+      body: DropTarget(
+        onDragDone: (detail) {
+          final paths = detail.files.map((f) => f.path).toList();
+          ref.read(uploadProvider.notifier).uploadPaths(paths, folderId: _currentFolderId);
+        },
+        child: Column(
+          children: [
+            if (_path.isNotEmpty) _breadcrumb(),
+            if (upload.isUploading) _uploadBanner(upload),
+            Expanded(child: _buildBody(state, folders, files)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  PreferredSizeWidget _normalAppBar(IndexState state) {
+    final atRoot = _path.isEmpty;
+    return AppBar(
+      leading: atRoot ? null : IconButton(icon: const Icon(Icons.arrow_back), onPressed: _goUp),
+      title: Text(atRoot ? 'TeleVault' : _path.last.name),
+      actions: [
+        if (state.isSaving)
+          const Padding(
+            padding: EdgeInsets.all(16),
+            child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+          ),
+        IconButton(
+          icon: const Icon(Icons.refresh),
+          onPressed: () => ref.read(indexProvider.notifier).load(),
+        ),
+      ],
+    );
+  }
+
+  PreferredSizeWidget _selectionAppBar(FileIndex index) {
+    return AppBar(
+      leading: IconButton(icon: const Icon(Icons.close), onPressed: _exitSelection),
+      title: Text('$_selCount selected'),
+      actions: [
+        if (_selCount == 1)
           IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: () => ref.read(indexProvider.notifier).load(),
+            icon: const Icon(Icons.drive_file_rename_outline),
+            tooltip: 'Rename',
+            onPressed: () => _renameSelected(index),
           ),
-        ],
-      ),
-      floatingActionButton: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          FloatingActionButton.small(
-            heroTag: 'newFolder',
-            onPressed: _createFolderDialog,
-            child: const Icon(Icons.create_new_folder_outlined),
+        IconButton(
+          icon: const Icon(Icons.drive_file_move_outline),
+          tooltip: 'Move to folder',
+          onPressed: () => _moveSelected(index),
+        ),
+        if (_selFiles.isNotEmpty)
+          IconButton(
+            icon: const Icon(Icons.download_outlined),
+            tooltip: 'Save to device',
+            onPressed: () => _saveSelected(index),
           ),
-          const SizedBox(height: 12),
-          FloatingActionButton.extended(
-            heroTag: 'upload',
-            onPressed: upload.isUploading
-                ? null
-                : () => ref.read(uploadProvider.notifier).pickAndUpload(folderId: _currentFolderId),
-            icon: const Icon(Icons.upload_file),
-            label: const Text('Upload'),
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          if (!atRoot) _breadcrumb(),
-          if (upload.isUploading) _uploadBanner(upload),
-          Expanded(child: _buildBody(state, download, folders, files)),
-        ],
-      ),
+        IconButton(
+          icon: const Icon(Icons.delete_outline),
+          tooltip: 'Delete',
+          onPressed: () => _deleteSelected(index),
+        ),
+      ],
     );
   }
 
@@ -166,7 +340,9 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Uploading ${upload.fileName ?? ''}  ${(upload.progress * 100).toStringAsFixed(0)}%',
+              upload.totalCount > 1
+                  ? 'Uploading ${upload.currentIndex}/${upload.totalCount}: ${upload.fileName ?? ''}  ${(upload.progress * 100).toStringAsFixed(0)}%'
+                  : 'Uploading ${upload.fileName ?? ''}  ${(upload.progress * 100).toStringAsFixed(0)}%',
               style: const TextStyle(fontSize: 12),
             ),
             const SizedBox(height: 6),
@@ -177,11 +353,8 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
     );
   }
 
-  Widget _buildBody(
-      IndexState state, DownloadState download, List folders, List files) {
-    if (state.isLoading) {
-      return const Center(child: CircularProgressIndicator());
-    }
+  Widget _buildBody(IndexState state, List<Folder> folders, List<FileItem> files) {
+    if (state.isLoading) return const Center(child: CircularProgressIndicator());
     if (state.error != null) {
       return Center(
         child: Padding(
@@ -207,35 +380,38 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
       children: [
         for (final folder in folders)
           ListTile(
+            key: ValueKey('folder_${folder.id}'),
+            selected: _selFolders.contains(folder.id),
+            selectedTileColor: const Color(0x222AABEE),
             leading: const Icon(Icons.folder, color: Color(0xFF2AABEE)),
             title: Text(folder.name),
-            onTap: () => _openFolder(folder),
-            trailing: IconButton(
-              icon: const Icon(Icons.delete_outline),
-              onPressed: () => ref.read(indexProvider.notifier).removeFolder(folder.id),
-            ),
+            onTap: () => _selecting ? _toggleFolder(folder) : _openFolder(folder),
+            onLongPress: () => _toggleFolder(folder),
+            trailing: _selecting
+                ? Icon(_selFolders.contains(folder.id)
+                    ? Icons.check_circle
+                    : Icons.circle_outlined)
+                : null,
           ),
         for (final file in files)
           ListTile(
-            leading: FileThumbnail(file: file, fallbackIcon: _iconFor(file)),
+            key: ValueKey('file_${file.id}'),
+            selected: _selFiles.contains(file.id),
+            selectedTileColor: const Color(0x222AABEE),
+            leading: FileThumbnail(
+              key: ValueKey('thumb_${file.id}'),
+              file: file,
+              fallbackIcon: _iconFor(file),
+            ),
             title: Text(file.name),
             subtitle: Text('${file.parts.length} part(s) · ${_humanSize(file.totalSize)}'),
-            onTap: () => _openFile(file),
-            trailing: download.fileId == file.id
-                ? SizedBox(
-                    width: 32,
-                    height: 32,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      value: download.progress == 0 ? null : download.progress,
-                    ),
-                  )
-                : IconButton(
-                    icon: const Icon(Icons.download_outlined),
-                    onPressed: download.isDownloading
-                        ? null
-                        : () => ref.read(downloadProvider.notifier).downloadAndOpen(file),
-                  ),
+            onTap: () => _selecting ? _toggleFile(file) : _openFile(file),
+            onLongPress: () => _toggleFile(file),
+            trailing: _selecting
+                ? Icon(_selFiles.contains(file.id)
+                    ? Icons.check_circle
+                    : Icons.circle_outlined)
+                : SaveToDeviceButton(file: file),
           ),
       ],
     );

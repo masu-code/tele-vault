@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:t/t.dart' as t;
 import '../../models/file_index.dart';
+import '../../models/file_item.dart';
 import '../download/download_plan.dart';
 import '../telegram/client.dart';
 import '../telegram/tg_utils.dart';
@@ -146,6 +147,21 @@ class IndexService {
     // Remove the superseded legacy text message so load() won't see two.
     if (staleId != null) {
       await _client.messages.deleteMessages(revoke: false, id: [staleId]);
+    }
+  }
+
+  /// Permanently deletes the given files' messages (all parts) from Telegram,
+  /// freeing the storage. The index update is the caller's responsibility.
+  Future<void> deleteFromTelegram(List<FileItem> items) async {
+    final ids = <int>[
+      for (final item in items)
+        for (final part in item.parts) part.messageId,
+    ];
+    if (ids.isEmpty) return;
+    // deleteMessages caps at ~100 ids per call; chunk to be safe.
+    for (var i = 0; i < ids.length; i += 100) {
+      final chunk = ids.sublist(i, i + 100 > ids.length ? ids.length : i + 100);
+      await _client.messages.deleteMessages(revoke: true, id: chunk);
     }
   }
 

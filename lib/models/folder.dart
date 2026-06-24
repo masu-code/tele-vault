@@ -1,3 +1,6 @@
+/// Distinguishes "argument omitted" from "explicitly set to null" in copyWith.
+const Object _unset = Object();
+
 /// A virtual folder. Folders exist only in the index — Telegram itself has
 /// no folder concept for stored files.
 class Folder {
@@ -25,9 +28,11 @@ class Folder {
         'parent_id': parentId,
       };
 
-  Folder copyWith({String? name, String? parentId}) => Folder(
+  /// [parentId] accepts null to move the folder to the root; omit it to keep
+  /// the current parent.
+  Folder copyWith({String? name, Object? parentId = _unset}) => Folder(
         id: id,
         name: name ?? this.name,
-        parentId: parentId ?? this.parentId,
+        parentId: identical(parentId, _unset) ? this.parentId : parentId as String?,
       );
 }

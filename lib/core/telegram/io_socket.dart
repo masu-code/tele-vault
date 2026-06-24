@@ -22,13 +22,24 @@ class IoSocket extends tg.SocketAbstraction {
   final Socket _socket;
   final _controller = StreamController<Uint8List>.broadcast();
 
+  /// Serializes writes: a dart:io socket can't be written to concurrently, and
+  /// many requests now run in parallel (gallery thumbnails + downloads). Each
+  /// send waits for the previous one to finish flushing, avoiding the
+  /// "StreamSink is bound to a stream" error.
+  Future<void> _sendChain = Future.value();
+
   @override
   Stream<Uint8List> get receiver => _controller.stream;
 
   @override
-  Future<void> send(List<int> data) async {
-    _socket.add(data);
-    await _socket.flush();
+  Future<void> send(List<int> data) {
+    final result = _sendChain.then((_) async {
+      _socket.add(data);
+      await _socket.flush();
+    });
+    // Keep the chain alive even if a send throws, so later sends still run.
+    _sendChain = result.catchError((_) {});
+    return result;
   }
 
   Future<void> close() async {
