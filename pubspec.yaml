@@ -46,6 +46,9 @@ dependencies:
   media_kit: ^1.1.11
   media_kit_video: ^1.2.5
   media_kit_libs_video: ^1.0.5
+  pool: ^1.5.1
+  image: ^4.2.0
+  visibility_detector: ^0.4.0+2
 
 dev_dependencies:
   flutter_test:

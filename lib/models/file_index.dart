@@ -45,6 +45,22 @@ class FileIndex {
   List<FileItem> filesIn(String? folderId) =>
       files.where((f) => f.folderId == folderId).toList();
 
+  /// All images and videos across every folder, newest first — the gallery
+  /// feed.
+  List<FileItem> get mediaFiles {
+    final media = files
+        .where((f) => f.mimeType.startsWith('image/') || f.mimeType.startsWith('video/'))
+        .toList();
+    media.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return media;
+  }
+
+  /// Looks up files by id, preserving the given order; missing ids are skipped.
+  List<FileItem> filesByIds(List<String> ids) {
+    final byId = {for (final f in files) f.id: f};
+    return [for (final id in ids) if (byId[id] != null) byId[id]!];
+  }
+
   /// Folders directly inside [parentId] (null = root).
   List<Folder> foldersIn(String? parentId) =>
       folders.where((f) => f.parentId == parentId).toList();

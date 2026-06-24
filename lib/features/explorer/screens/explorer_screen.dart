@@ -24,14 +24,6 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
 
   String? get _currentFolderId => _path.isEmpty ? null : _path.last.id;
 
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(indexProvider.notifier).load();
-    });
-  }
-
   void _openFolder(Folder folder) => setState(() => _path.add(folder));
 
   void _goUp() => setState(() => _path.removeLast());

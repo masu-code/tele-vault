@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../features/auth/providers/auth_provider.dart';
 import '../features/auth/screens/phone_screen.dart';
-import '../features/explorer/screens/explorer_screen.dart';
+import '../features/shell/main_shell.dart';
 
 class TeleVaultApp extends ConsumerWidget {
   const TeleVaultApp({super.key});
@@ -20,7 +20,7 @@ class TeleVaultApp extends ConsumerWidget {
           surface: Color(0xFF1C1C1E),
         ),
       ),
-      home: auth.isAuthenticated ? const ExplorerScreen() : const PhoneScreen(),
+      home: auth.isAuthenticated ? const MainShell() : const PhoneScreen(),
     );
   }
 }

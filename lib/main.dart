@@ -8,6 +8,12 @@ import 'app/app.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // Cap the in-memory decoded-image cache so scrolling a large gallery can't
+  // accumulate thousands of bitmaps and run out of memory.
+  PaintingBinding.instance.imageCache
+    ..maximumSize = 200
+    ..maximumSizeBytes = 100 << 20; // 100 MB
+
   // Required for in-app video playback (Windows + Android).
   MediaKit.ensureInitialized();
 
