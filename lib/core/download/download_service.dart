@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:t/t.dart' as t;
 import '../../models/file_item.dart';
 import '../telegram/client.dart';
@@ -29,7 +30,7 @@ class DownloadService {
     try {
       final ordered = [...item.parts]..sort((a, b) => a.part.compareTo(b.part));
       for (final part in ordered) {
-        final doc = await _fetchDocument(part.messageId);
+        final doc = await fetchDocument(part.messageId);
         final location = t.InputDocumentFileLocation(
           id: doc.id,
           accessHash: doc.accessHash,
@@ -69,9 +70,29 @@ class DownloadService {
     return out;
   }
 
+  /// Downloads [item] into a temporary cache and returns the cached file,
+  /// reusing it if already present (used for in-app preview). Cached under a
+  /// per-file-id folder so names with the original extension are preserved.
+  Future<File> downloadToCache(
+    FileItem item, {
+    void Function(double progress)? onProgress,
+  }) async {
+    final tmp = await getTemporaryDirectory();
+    final dir = Directory(p.join(tmp.path, 'televault_cache', item.id));
+    await dir.create(recursive: true);
+    final cached = File(p.join(dir.path, item.name));
+
+    if (await cached.exists() && await cached.length() == item.totalSize) {
+      onProgress?.call(1);
+      return cached;
+    }
+    return downloadFile(item, destDir: dir.path, onProgress: onProgress);
+  }
+
   /// Fetches the [t.Document] backing a stored part by its message id. The
   /// file reference is read fresh here because Telegram references expire.
-  Future<t.Document> _fetchDocument(int messageId) async {
+  /// Public so the thumbnail service can read a video's embedded thumbnail.
+  Future<t.Document> fetchDocument(int messageId) async {
     final result =
         await _client.messages.getMessages(id: [t.InputMessageID(id: messageId)]);
     if (result.error != null) {

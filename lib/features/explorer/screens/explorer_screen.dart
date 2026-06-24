@@ -1,9 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../download/providers/download_provider.dart';
+import '../../preview/screens/image_preview_screen.dart';
+import '../../preview/screens/video_preview_screen.dart';
 import '../../upload/providers/upload_provider.dart';
+import '../../../models/file_item.dart';
 import '../../../models/folder.dart';
 import '../providers/index_provider.dart';
+import '../widgets/file_thumbnail.dart';
 
 /// File browser backed by the Telegram index. Supports navigating into folders;
 /// uploads and new folders are created inside the folder currently open.
@@ -31,6 +35,23 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
   void _openFolder(Folder folder) => setState(() => _path.add(folder));
 
   void _goUp() => setState(() => _path.removeLast());
+
+  /// Images and videos preview in-app; everything else is downloaded and
+  /// handed to the device's default handler.
+  void _openFile(FileItem file) {
+    final mime = file.mimeType;
+    if (mime.startsWith('image/')) {
+      Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => ImagePreviewScreen(file: file)),
+      );
+    } else if (mime.startsWith('video/')) {
+      Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => VideoPreviewScreen(file: file)),
+      );
+    } else {
+      ref.read(downloadProvider.notifier).downloadAndOpen(file);
+    }
+  }
 
   Future<void> _createFolderDialog() async {
     final controller = TextEditingController();
@@ -204,9 +225,10 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
           ),
         for (final file in files)
           ListTile(
-            leading: const Icon(Icons.insert_drive_file_outlined),
+            leading: FileThumbnail(file: file, fallbackIcon: _iconFor(file)),
             title: Text(file.name),
             subtitle: Text('${file.parts.length} part(s) · ${_humanSize(file.totalSize)}'),
+            onTap: () => _openFile(file),
             trailing: download.fileId == file.id
                 ? SizedBox(
                     width: 32,
@@ -225,6 +247,15 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
           ),
       ],
     );
+  }
+
+  static IconData _iconFor(FileItem file) {
+    final mime = file.mimeType;
+    if (mime.startsWith('image/')) return Icons.image_outlined;
+    if (mime.startsWith('video/')) return Icons.movie_outlined;
+    if (mime.startsWith('audio/')) return Icons.audiotrack_outlined;
+    if (mime == 'application/pdf') return Icons.picture_as_pdf_outlined;
+    return Icons.insert_drive_file_outlined;
   }
 
   static String _humanSize(int bytes) {
