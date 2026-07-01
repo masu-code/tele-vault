@@ -46,8 +46,6 @@ class ThumbnailService {
 
   Directory? _dir;
 
-  t.Client get _client => TelegramService.instance.client;
-
   /// Marks a thumbnail job as cancellable; a not-yet-started job will be
   /// skipped. Called when a tile leaves the viewport.
   void cancel(String fileId) => _cancelled.add(fileId);
@@ -124,19 +122,20 @@ class ThumbnailService {
       if (th is t.PhotoSize && (best == null || th.size < best.size)) best = th;
     }
     if (best == null) return null;
+    final bestThumb = best; // non-nullable alias — analyzer loses null-safety across lambdas
 
-    final result = await _client.upload.getFile(
+    final result = await TelegramService.instance.call((c) => c.upload.getFile(
       precise: false,
       cdnSupported: false,
       location: t.InputDocumentFileLocation(
         id: doc.id,
         accessHash: doc.accessHash,
         fileReference: doc.fileReference,
-        thumbSize: best.type,
+        thumbSize: bestThumb.type,
       ),
       offset: 0,
       limit: 1024 * 1024,
-    ).timeout(_netTimeout);
+    ));
 
     final uploaded = result.result;
     return uploaded is t.UploadFile ? uploaded.bytes : null;

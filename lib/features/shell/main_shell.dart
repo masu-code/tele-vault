@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../albums/screens/albums_screen.dart';
+import '../backup/providers/backup_provider.dart';
 import '../explorer/providers/index_provider.dart';
 import '../explorer/screens/explorer_screen.dart';
 import '../gallery/screens/gallery_screen.dart';
@@ -22,8 +23,13 @@ class _MainShellState extends ConsumerState<MainShell> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(indexProvider.notifier).load();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await ref.read(indexProvider.notifier).load();
+      // Registry init only (SharedPreferences) — no photo permission request.
+      // Device albums and permissions are loaded lazily in AlbumsScreen when
+      // the user navigates there, to avoid the system photo picker blocking
+      // the entire app UI on first launch.
+      await ref.read(backupProvider.notifier).initRegistry();
     });
   }
 

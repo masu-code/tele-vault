@@ -81,14 +81,6 @@ class DownloadNotifier extends StateNotifier<DownloadState> {
     }
   }
 
-  /// Opens the device file explorer at the saved file's location.
-  Future<void> revealOnDevice(FileItem item) async {
-    try {
-      await LocalFileService.instance.reveal(item);
-    } catch (e) {
-      state = DownloadState(error: e.toString());
-    }
-  }
 }
 
 final downloadProvider =

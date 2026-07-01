@@ -39,12 +39,10 @@ class IndexService {
   /// to persist once so it gets rewritten as a document.
   bool get needsMigration => _legacy;
 
-  t.Client get _client => TelegramService.instance.client;
-
   /// Loads the index, scanning recent Saved Messages for the tagged message.
   /// Returns an empty index if none exists yet.
   Future<FileIndex> load() async {
-    final result = await _client.messages.getHistory(
+    final result = await TelegramService.instance.call((c) => c.messages.getHistory(
       peer: const t.InputPeerSelf(),
       offsetId: 0,
       offsetDate: DateTime.fromMillisecondsSinceEpoch(0),
@@ -53,7 +51,7 @@ class IndexService {
       maxId: 0,
       minId: 0,
       hash: 0,
-    );
+    ));
     if (result.error != null) {
       throw IndexException('Failed to read history: ${result.error!.errorMessage}');
     }
@@ -109,14 +107,14 @@ class IndexService {
 
     // Edit the existing document message in place when we have one.
     if (_messageId != null && !_legacy) {
-      final result = await _client.messages.editMessage(
+      final result = await TelegramService.instance.call((c) => c.messages.editMessage(
         noWebpage: true,
         invertMedia: false,
         peer: const t.InputPeerSelf(),
         id: _messageId!,
         message: _marker,
         media: media,
-      );
+      ));
       if (result.error == null) return;
       // The message may be gone; fall through to create a fresh one.
       _messageId = null;
@@ -125,7 +123,7 @@ class IndexService {
     // Create a new index document.
     final staleId = _messageId; // legacy text message to clean up, if any
     final randomId = randomInt64();
-    final result = await _client.messages.sendMedia(
+    final result = await TelegramService.instance.call((c) => c.messages.sendMedia(
       silent: true,
       background: false,
       clearDraft: false,
@@ -137,7 +135,7 @@ class IndexService {
       media: media,
       message: _marker,
       randomId: randomId,
-    );
+    ));
     if (result.error != null) {
       throw IndexException('Failed to write index: ${result.error!.errorMessage}');
     }
@@ -146,7 +144,9 @@ class IndexService {
 
     // Remove the superseded legacy text message so load() won't see two.
     if (staleId != null) {
-      await _client.messages.deleteMessages(revoke: false, id: [staleId]);
+      await TelegramService.instance.call(
+        (c) => c.messages.deleteMessages(revoke: false, id: [staleId]),
+      );
     }
   }
 
@@ -161,7 +161,9 @@ class IndexService {
     // deleteMessages caps at ~100 ids per call; chunk to be safe.
     for (var i = 0; i < ids.length; i += 100) {
       final chunk = ids.sublist(i, i + 100 > ids.length ? ids.length : i + 100);
-      await _client.messages.deleteMessages(revoke: true, id: chunk);
+      await TelegramService.instance.call(
+        (c) => c.messages.deleteMessages(revoke: true, id: chunk),
+      );
     }
   }
 
@@ -175,10 +177,13 @@ class IndexService {
     for (var part = 0; part < totalParts; part++) {
       final start = part * chunkSize;
       final end = (start + chunkSize) < bytes.length ? start + chunkSize : bytes.length;
-      final result = await _client.upload.saveFilePart(
-        fileId: fileId,
-        filePart: part,
-        bytes: Uint8List.sublistView(bytes, start, end),
+      final chunk = Uint8List.sublistView(bytes, start, end);
+      final result = await TelegramService.instance.call(
+        (c) => c.upload.saveFilePart(
+          fileId: fileId,
+          filePart: part,
+          bytes: chunk,
+        ),
       );
       if (result.error != null) {
         throw IndexException('Index upload failed at part $part: ${result.error!.errorMessage}');
@@ -202,13 +207,13 @@ class IndexService {
     );
     final builder = BytesBuilder();
     for (final range in downloadRanges(doc.size)) {
-      final result = await _client.upload.getFile(
+      final result = await TelegramService.instance.call((c) => c.upload.getFile(
         precise: false,
         cdnSupported: false,
         location: location,
         offset: range.offset,
         limit: range.limit,
-      );
+      ));
       if (result.error != null) {
         throw IndexException('Index download failed: ${result.error!.errorMessage}');
       }

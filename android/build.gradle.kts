@@ -14,6 +14,11 @@ rootProject.layout.buildDirectory.value(newBuildDir)
 subprojects {
     val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
     project.layout.buildDirectory.value(newSubprojectBuildDir)
+    // Force older plugins (e.g. desktop_drop) to compile against SDK 36.
+    afterEvaluate {
+        extensions.findByType(com.android.build.gradle.LibraryExtension::class.java)
+            ?.compileSdk = 36
+    }
 }
 subprojects {
     project.evaluationDependsOn(":app")

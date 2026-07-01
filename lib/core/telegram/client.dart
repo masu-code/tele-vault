@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:path_provider/path_provider.dart';
 import 'package:t/t.dart' as t;
 import 'package:tg/tg.dart' as tg;
@@ -72,8 +74,9 @@ class TelegramService {
 
     await ioSocket.send(obfuscation.preamble);
 
-    final key =
-        authKey ?? await tg.Client.authorize(ioSocket, obfuscation, idGenerator);
+    final key = authKey ??
+        await tg.Client.authorize(ioSocket, obfuscation, idGenerator)
+            .timeout(const Duration(seconds: 20));
 
     final client = tg.Client(
       socket: ioSocket,
@@ -91,7 +94,7 @@ class TelegramService {
       langPack: '',
       langCode: 'en',
       query: const t.HelpGetConfig(),
-    );
+    ).timeout(const Duration(seconds: 20));
 
     // Capture the authoritative DC list so migrations land on the right server.
     final config = cfg.result;
@@ -109,6 +112,41 @@ class TelegramService {
     _client = null;
     _socket = null;
     await connect(dcId: dcId);
+  }
+
+  /// Executes [action] against the live client, reconnecting once on any
+  /// transport failure (SocketDeadException, TimeoutException, SocketException).
+  /// Use this instead of accessing [client] directly in all services so that
+  /// MIUI's aggressive socket-killing is handled transparently.
+  Future<T> call<T>(Future<T> Function(tg.Client) action) async {
+    if (_socket?.isDead == true || _client == null) await reconnect();
+    try {
+      return await action(client).timeout(const Duration(seconds: 30));
+    } on TimeoutException {
+      await reconnect();
+      return await action(client).timeout(const Duration(seconds: 30));
+    } on SocketDeadException {
+      await reconnect();
+      return await action(client).timeout(const Duration(seconds: 30));
+    } on SocketException {
+      await reconnect();
+      return await action(client).timeout(const Duration(seconds: 30));
+    }
+  }
+
+  /// Test-only: simulates MIUI killing the live socket. The next [call] must
+  /// detect the dead socket and reconnect transparently.
+  @visibleForTesting
+  void debugKillSocket() => _socket?.debugKill();
+
+  /// Reconnects to the current DC reusing the existing authorization key.
+  /// Call this when a timeout indicates the socket died (e.g. MIUI killed it).
+  Future<void> reconnect() async {
+    final key = _client?.authorizationKey;
+    await _socket?.close();
+    _client = null;
+    _socket = null;
+    await connect(dcId: _dcId, authKey: key);
   }
 
   /// Restores a saved session, reconnecting to its DC with its key. Returns

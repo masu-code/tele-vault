@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/local_storage/local_file_service.dart';
 import '../../download/providers/download_provider.dart';
 import '../../explorer/providers/index_provider.dart';
+import '../../explorer/widgets/save_to_device_button.dart';
 import '../../gallery/widgets/gallery_tile.dart';
 import '../../preview/screens/media_viewer_screen.dart';
 import '../../../models/file_item.dart';
@@ -97,21 +98,11 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
               leading: IconButton(icon: const Icon(Icons.close), onPressed: _exitSelection),
               title: Text('${_selected.length} selected'),
               actions: [
-                if (_selected.length == 1 && allSaved)
-                  IconButton(
-                    icon: const Icon(Icons.folder_open_outlined),
-                    tooltip: 'Show location',
-                    onPressed: () {
-                      final f = items.firstWhere((m) => m.id == _selected.first);
-                      ref.read(downloadProvider.notifier).revealOnDevice(f);
-                    },
-                  )
-                else if (allSaved)
-                  IconButton(
-                    icon: const Icon(Icons.download_done, color: Color(0xFF2AABEE)),
-                    tooltip: 'All already on device',
-                    onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('All selected are already on your device')),
+                if (allSaved)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: Center(
+                      child: Icon(onDeviceIcon(), color: const Color(0xFF2AABEE)),
                     ),
                   )
                 else

@@ -1,4 +1,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Internet access for Telegram MTProto -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- Media access: Android 13+ (API 33+) uses granular permissions -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+    <!-- Android 14+ partial media access -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED"/>
+    <!-- Android 12 and below -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+
     <application
         android:label="tele_vault"
         android:name="${applicationName}"
@@ -25,6 +36,12 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- Disable Impeller: on some Adreno/MIUI devices the Impeller backend
+             renders a black screen even though the engine runs and no Dart
+             error is thrown. Falls back to the stable Skia renderer. -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="false" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

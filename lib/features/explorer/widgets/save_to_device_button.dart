@@ -5,9 +5,14 @@ import '../../../core/local_storage/local_file_service.dart';
 import '../../../models/file_item.dart';
 import '../../download/providers/download_provider.dart';
 
+/// Icon used everywhere to mean "already on this device" (Gallery, Albums,
+/// Files) — kept as one constant so the indicator stays visually consistent.
+IconData onDeviceIcon() =>
+    (Platform.isAndroid || Platform.isIOS) ? Icons.smartphone : Icons.computer;
+
 /// Trailing action for a file row:
 /// - not saved on the device → a download icon that saves it;
-/// - already saved → a device icon that reveals it in the OS file explorer;
+/// - already saved → a plain "on device" indicator;
 /// - while saving → a progress spinner.
 class SaveToDeviceButton extends ConsumerStatefulWidget {
   const SaveToDeviceButton({super.key, required this.file});
@@ -25,6 +30,17 @@ class _SaveToDeviceButtonState extends ConsumerState<SaveToDeviceButton> {
   void initState() {
     super.initState();
     _refresh();
+  }
+
+  @override
+  void didUpdateWidget(SaveToDeviceButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // If this widget is recycled for a different file (list reorder/filter),
+    // its cached saved-state no longer applies — recheck.
+    if (oldWidget.file.id != widget.file.id) {
+      setState(() => _saved = false);
+      _refresh();
+    }
   }
 
   Future<void> _refresh() async {
@@ -53,12 +69,12 @@ class _SaveToDeviceButtonState extends ConsumerState<SaveToDeviceButton> {
     }
 
     if (_saved) {
-      final deviceIcon =
-          (Platform.isAndroid || Platform.isIOS) ? Icons.smartphone : Icons.computer;
-      return IconButton(
-        icon: Icon(deviceIcon, color: const Color(0xFF2AABEE)),
-        tooltip: 'Saved on device — show location',
-        onPressed: () => ref.read(downloadProvider.notifier).revealOnDevice(widget.file),
+      return SizedBox(
+        width: 40,
+        height: 40,
+        child: Center(
+          child: Icon(onDeviceIcon(), color: const Color(0xFF2AABEE)),
+        ),
       );
     }
 

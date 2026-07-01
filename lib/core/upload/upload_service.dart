@@ -22,14 +22,17 @@ class UploadService {
   UploadService._();
   static final UploadService instance = UploadService._();
 
-  t.Client get _client => TelegramService.instance.client;
-
   /// Uploads [file] and returns the resulting [FileItem]. [onProgress] is
   /// called with a 0..1 fraction as bytes are sent.
+  ///
+  /// [maxSegmentSizeOverride] exists only so integration tests can force a
+  /// small file through the multi-segment (>2GB-file) path without actually
+  /// uploading gigabytes of data; production code must never pass it.
   Future<FileItem> uploadFile(
     File file, {
     String? folderId,
     void Function(double progress)? onProgress,
+    int? maxSegmentSizeOverride,
   }) async {
     final totalSize = await file.length();
     if (totalSize == 0) {
@@ -38,7 +41,10 @@ class UploadService {
 
     final name = p.basename(file.path);
     final mime = lookupMimeType(name) ?? 'application/octet-stream';
-    final segments = planSegments(totalSize);
+    final segments = planSegments(
+      totalSize,
+      maxSegmentSize: maxSegmentSizeOverride ?? UploadLimits.maxSegmentSize,
+    );
 
     final raf = await file.open();
     final parts = <FilePart>[];
@@ -95,18 +101,19 @@ class UploadService {
           remaining < UploadLimits.chunkSize ? remaining : UploadLimits.chunkSize;
       final bytes = await raf.read(toRead);
 
+      // bytes is captured in the lambda; on reconnect the same part is retried.
       final result = isBig
-          ? await _client.upload.saveBigFilePart(
-              fileId: fileId,
-              filePart: partIndex,
-              fileTotalParts: totalParts,
-              bytes: bytes,
-            )
-          : await _client.upload.saveFilePart(
-              fileId: fileId,
-              filePart: partIndex,
-              bytes: bytes,
-            );
+          ? await TelegramService.instance.call((c) => c.upload.saveBigFilePart(
+                fileId: fileId,
+                filePart: partIndex,
+                fileTotalParts: totalParts,
+                bytes: bytes,
+              ))
+          : await TelegramService.instance.call((c) => c.upload.saveFilePart(
+                fileId: fileId,
+                filePart: partIndex,
+                bytes: bytes,
+              ));
 
       if (result.error != null) {
         throw UploadException(
@@ -125,7 +132,7 @@ class UploadService {
 
     final media = t.InputMediaUploadedDocument(
       nosoundVideo: false,
-      forceFile: true, // keep the bytes verbatim, no video/photo auto-detection
+      forceFile: true,
       spoiler: false,
       file: isBig
           ? t.InputFileBig(id: fileId, parts: totalParts, name: segName)
@@ -135,7 +142,7 @@ class UploadService {
     );
 
     final randomId = randomInt64();
-    final result = await _client.messages.sendMedia(
+    final result = await TelegramService.instance.call((c) => c.messages.sendMedia(
       silent: true,
       background: false,
       clearDraft: false,
@@ -147,7 +154,7 @@ class UploadService {
       media: media,
       message: '',
       randomId: randomId,
-    );
+    ));
 
     if (result.error != null) {
       throw UploadException('sendMedia failed: ${result.error!.errorMessage}');

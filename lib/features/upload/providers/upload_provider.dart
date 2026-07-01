@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
+import '../../../core/backup/backup_registry.dart';
 import '../../../core/upload/upload_service.dart';
 import '../../explorer/providers/index_provider.dart';
 
@@ -72,6 +73,7 @@ class UploadNotifier extends StateNotifier<UploadState> {
           onProgress: (pr) => state = state.copyWith(progress: pr),
         );
         await _ref.read(indexProvider.notifier).addFile(item);
+        await BackupRegistry.instance.linkLocalPath(item.id, paths[i]);
       } catch (e) {
         state = state.copyWith(isUploading: false, error: 'Failed on $name: $e');
         return;

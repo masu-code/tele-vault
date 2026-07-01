@@ -6,6 +6,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import '../../../core/download/download_service.dart';
 import '../../../models/file_item.dart';
+import '../video_controls.dart';
 
 /// Lets a PageView be dragged with a mouse (desktop), not just touch.
 class _DragScrollBehavior extends MaterialScrollBehavior {
@@ -228,6 +229,6 @@ class _VideoPageState extends State<_VideoPage> {
         child: CircularProgressIndicator(value: _progress == 0 ? null : _progress),
       );
     }
-    return Video(controller: _controller);
+    return Video(controller: _controller, controls: videoControlsWithSafeInsets);
   }
 }

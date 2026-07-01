@@ -27,6 +27,21 @@ class _FileThumbnailState extends State<FileThumbnail> {
   @override
   void initState() {
     super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(FileThumbnail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // If this widget is recycled for a different file (list reorder/filter),
+    // its cached thumbnail no longer applies — reload.
+    if (oldWidget.file.id != widget.file.id) {
+      setState(() { _thumb = null; _done = false; });
+      _load();
+    }
+  }
+
+  void _load() {
     if (_previewable) {
       ThumbnailService.instance.thumbnailFor(widget.file).then((f) {
         if (mounted) setState(() { _thumb = f; _done = true; });
