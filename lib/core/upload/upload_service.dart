@@ -22,6 +22,26 @@ class UploadService {
   UploadService._();
   static final UploadService instance = UploadService._();
 
+  /// Serializes every upload app-wide. There are multiple independent
+  /// callers (the bulk transfer queue, BackupService's per-album auto-sync,
+  /// on-demand single-asset uploads) that can legitimately fire at the same
+  /// time — e.g. auto-backup for a previously-enabled album kicking off at
+  /// startup while the transfer queue is also mid-upload. Running two
+  /// multi-part uploads concurrently over the same Telegram connection
+  /// corrupted the session's protocol state badly enough that the server
+  /// killed it outright (AUTH_KEY_UNREGISTERED), rather than just
+  /// flood-waiting. Chaining every call through here — the same pattern as
+  /// IndexNotifier's `_writeChain` and IoSocket's `_sendChain` — guarantees
+  /// uploads never overlap, without slowing down any single upload's own
+  /// throughput (each still runs at full speed, just strictly one at a time).
+  Future<void> _chain = Future.value();
+
+  Future<T> _serialized<T>(Future<T> Function() action) {
+    final result = _chain.then((_) => action());
+    _chain = result.then((_) {}, onError: (_) {});
+    return result;
+  }
+
   /// Uploads [file] and returns the resulting [FileItem]. [onProgress] is
   /// called with a 0..1 fraction as bytes are sent.
   ///
@@ -29,6 +49,19 @@ class UploadService {
   /// small file through the multi-segment (>2GB-file) path without actually
   /// uploading gigabytes of data; production code must never pass it.
   Future<FileItem> uploadFile(
+    File file, {
+    String? folderId,
+    void Function(double progress)? onProgress,
+    int? maxSegmentSizeOverride,
+  }) =>
+      _serialized(() => _uploadFile(
+            file,
+            folderId: folderId,
+            onProgress: onProgress,
+            maxSegmentSizeOverride: maxSegmentSizeOverride,
+          ));
+
+  Future<FileItem> _uploadFile(
     File file, {
     String? folderId,
     void Function(double progress)? onProgress,
@@ -51,17 +84,38 @@ class UploadService {
     var uploadedBytes = 0;
     try {
       for (final seg in segments) {
-        final messageId = await _uploadSegment(
-          raf,
-          seg,
-          name,
-          mime,
-          segments.length,
-          (chunkBytes) {
-            uploadedBytes += chunkBytes;
-            onProgress?.call(uploadedBytes / totalSize);
-          },
-        );
+        final int messageId;
+        try {
+          messageId = await _uploadSegment(
+            raf,
+            seg,
+            name,
+            mime,
+            segments.length,
+            (chunkBytes) {
+              uploadedBytes += chunkBytes;
+              onProgress?.call(uploadedBytes / totalSize);
+            },
+          );
+        } catch (e) {
+          // A multi-segment file (>2GB) sends each segment as its own
+          // Telegram message. If segment N fails after segments 1..N-1
+          // already succeeded, those messages would otherwise sit orphaned
+          // in Saved Messages forever — this FileItem never gets created, so
+          // nothing in the index would ever reference them for cleanup.
+          if (parts.isNotEmpty) {
+            try {
+              await TelegramService.instance.call((c) => c.messages.deleteMessages(
+                    revoke: true,
+                    id: [for (final p in parts) p.messageId],
+                  ));
+            } catch (_) {
+              // Best-effort cleanup — the original upload failure is what
+              // matters to the caller either way.
+            }
+          }
+          rethrow;
+        }
         parts.add(FilePart(messageId: messageId, part: seg.index, size: seg.size));
       }
     } finally {
@@ -103,17 +157,17 @@ class UploadService {
 
       // bytes is captured in the lambda; on reconnect the same part is retried.
       final result = isBig
-          ? await TelegramService.instance.call((c) => c.upload.saveBigFilePart(
+          ? await withAuthKeyRetry(() => TelegramService.instance.call((c) => c.upload.saveBigFilePart(
                 fileId: fileId,
                 filePart: partIndex,
                 fileTotalParts: totalParts,
                 bytes: bytes,
-              ))
-          : await TelegramService.instance.call((c) => c.upload.saveFilePart(
+              )))
+          : await withAuthKeyRetry(() => TelegramService.instance.call((c) => c.upload.saveFilePart(
                 fileId: fileId,
                 filePart: partIndex,
                 bytes: bytes,
-              ));
+              )));
 
       if (result.error != null) {
         throw UploadException(
@@ -142,7 +196,7 @@ class UploadService {
     );
 
     final randomId = randomInt64();
-    final result = await TelegramService.instance.call((c) => c.messages.sendMedia(
+    final result = await withAuthKeyRetry(() => TelegramService.instance.call((c) => c.messages.sendMedia(
       silent: true,
       background: false,
       clearDraft: false,
@@ -154,7 +208,7 @@ class UploadService {
       media: media,
       message: '',
       randomId: randomId,
-    ));
+    )));
 
     if (result.error != null) {
       throw UploadException('sendMedia failed: ${result.error!.errorMessage}');

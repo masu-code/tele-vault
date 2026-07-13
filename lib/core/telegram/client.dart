@@ -139,9 +139,36 @@ class TelegramService {
   @visibleForTesting
   void debugKillSocket() => _socket?.debugKill();
 
+  /// In-flight reconnect, shared by every concurrent caller — see [reconnect].
+  Future<void>? _reconnecting;
+
   /// Reconnects to the current DC reusing the existing authorization key.
   /// Call this when a timeout indicates the socket died (e.g. MIUI killed it).
-  Future<void> reconnect() async {
+  ///
+  /// Backgrounding the app (MIUI cuts network) can make many in-flight
+  /// requests fail at once, and [call] invokes this per-request — without
+  /// the guard below, two concurrent callers could interleave: the first
+  /// reads the current key and nulls out [_client], then the SECOND reads
+  /// [_client]`?.authorizationKey` and gets null (the first caller already
+  /// cleared it), so it reconnects with authKey: null — a fresh MTProto
+  /// handshake that the server never associated with this Telegram account,
+  /// silently swapping in an unusable key. Every subsequent request then
+  /// fails with AUTH_KEY_UNREGISTERED, and reconnecting again doesn't help
+  /// because the corruption already happened. Sharing one in-flight
+  /// reconnect future means concurrent callers all wait for and reuse the
+  /// same successful reconnect instead of racing to start their own.
+  Future<void> reconnect() {
+    final inFlight = _reconnecting;
+    if (inFlight != null) return inFlight;
+    final future = _doReconnect();
+    _reconnecting = future;
+    future.whenComplete(() {
+      if (identical(_reconnecting, future)) _reconnecting = null;
+    });
+    return future;
+  }
+
+  Future<void> _doReconnect() async {
     final key = _client?.authorizationKey;
     await _socket?.close();
     _client = null;

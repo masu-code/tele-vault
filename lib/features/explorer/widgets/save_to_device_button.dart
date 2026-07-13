@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../core/backup/device_state_bus.dart';
 import '../../../core/local_storage/local_file_service.dart';
 import '../../../models/file_item.dart';
 import '../../download/providers/download_provider.dart';
@@ -51,6 +52,12 @@ class _SaveToDeviceButtonState extends ConsumerState<SaveToDeviceButton> {
   @override
   Widget build(BuildContext context) {
     final download = ref.watch(downloadProvider);
+    // ExplorerScreen is kept alive in an IndexedStack, so without this the
+    // cached _saved flag would never notice a delete/save that happened
+    // elsewhere (Gallery, Albums, the viewer) and stay stale forever.
+    ref.listen(deviceStateVersion, (prev, next) {
+      if (prev != next) _refresh();
+    });
 
     if (download.fileId == widget.file.id) {
       return SizedBox(

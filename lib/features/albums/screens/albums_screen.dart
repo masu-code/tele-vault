@@ -8,6 +8,7 @@ import '../../../models/album.dart';
 import '../../../models/file_item.dart';
 import '../../backup/providers/backup_provider.dart';
 import '../../explorer/providers/index_provider.dart';
+import '../../profile/widgets/floating_profile_header.dart';
 import 'album_detail_screen.dart';
 import 'device_album_detail_screen.dart';
 
@@ -152,33 +153,36 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
 
     final totalCount = vaultAlbums.length + deviceAlbums.length;
 
+    final topInset = MediaQuery.of(context).padding.top + kToolbarHeight + 8;
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Albums')),
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _createAlbum,
         icon: const Icon(Icons.add),
         label: const Text('New album'),
       ),
-      body: totalCount == 0
-          ? Center(
-              child: Text(
-                Platform.isAndroid
-                    ? 'No albums yet.\nCreate one or enable backup for a device album.'
-                    : 'No albums yet.\nCreate one here or select photos in the Gallery.',
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white54),
-              ),
-            )
-          : GridView.builder(
-              padding: const EdgeInsets.all(12),
-              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                maxCrossAxisExtent: 200,
-                crossAxisSpacing: 12,
-                mainAxisSpacing: 12,
-                childAspectRatio: 0.85,
-              ),
-              itemCount: totalCount,
-              itemBuilder: (context, i) {
+      body: Stack(
+        children: [
+          totalCount == 0
+              ? Center(
+                  child: Text(
+                    Platform.isAndroid
+                        ? 'No albums yet.\nCreate one or enable backup for a device album.'
+                        : 'No albums yet.\nCreate one here or select photos in the Gallery.',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white54),
+                  ),
+                )
+              : GridView.builder(
+                  padding: EdgeInsets.fromLTRB(12, topInset, 12, 12),
+                  gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                    maxCrossAxisExtent: 200,
+                    crossAxisSpacing: 12,
+                    mainAxisSpacing: 12,
+                    childAspectRatio: 0.85,
+                  ),
+                  itemCount: totalCount,
+                  itemBuilder: (context, i) {
                 // Device albums come first.
                 if (i < deviceAlbums.length) {
                   final album = deviceAlbums[i];
@@ -187,6 +191,7 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
                     key: ValueKey('device_${album.id}'),
                     album: album,
                     hasCloud: isEnabled,
+                    refreshTick: backup.refreshTick,
                     onTap: () => Navigator.of(context).push(MaterialPageRoute(
                       builder: (_) => DeviceAlbumDetailScreen(album: album),
                     )),
@@ -200,14 +205,18 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
                 return _VaultAlbumCard(
                   key: ValueKey('vault_${album.id}'),
                   album: album,
+                  itemCount: items.length,
                   cover: cover,
                   onTap: () => Navigator.of(context).push(MaterialPageRoute(
                     builder: (_) => AlbumDetailScreen(albumId: album.id),
                   )),
                   onLongPress: () => _vaultAlbumMenu(album),
                 );
-              },
-            ),
+                  },
+                ),
+          const FloatingProfileHeader(title: 'Albums'),
+        ],
+      ),
     );
   }
 }
@@ -220,12 +229,19 @@ class _VaultAlbumCard extends StatelessWidget {
   const _VaultAlbumCard({
     super.key,
     required this.album,
+    required this.itemCount,
     required this.cover,
     required this.onTap,
     required this.onLongPress,
   });
 
   final Album album;
+  // The number of files actually resolvable in the index — not
+  // album.fileIds.length, which would overcount if the album still
+  // references a file id that no longer exists (e.g. a stale index written
+  // by an older app version that didn't clean up album membership on
+  // delete).
+  final int itemCount;
   final FileItem? cover;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
@@ -277,7 +293,7 @@ class _VaultAlbumCard extends StatelessWidget {
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontWeight: FontWeight.w500)),
-          Text('${album.fileIds.length} item(s)',
+          Text('$itemCount item(s)',
               style: const TextStyle(fontSize: 12, color: Colors.white54)),
         ],
       ),
@@ -336,12 +352,17 @@ class _DeviceAlbumCard extends StatefulWidget {
     required this.hasCloud,
     required this.onTap,
     required this.onLongPress,
+    required this.refreshTick,
   });
 
   final AssetPathEntity album;
   final bool hasCloud;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
+
+  /// Bumped by [BackupNotifier.refreshDeviceAlbums] — forces this card to
+  /// reload its cover/count even though the album's own id is unchanged.
+  final int refreshTick;
 
   @override
   State<_DeviceAlbumCard> createState() => _DeviceAlbumCardState();
@@ -360,7 +381,8 @@ class _DeviceAlbumCardState extends State<_DeviceAlbumCard> {
   @override
   void didUpdateWidget(_DeviceAlbumCard oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.album.id != widget.album.id) {
+    if (oldWidget.album.id != widget.album.id ||
+        oldWidget.refreshTick != widget.refreshTick) {
       setState(() { _cover = null; _count = 0; });
       _load();
     }
@@ -458,6 +480,8 @@ class _DeviceCoverState extends State<_DeviceCover> {
         .thumbnailDataWithSize(const ThumbnailSize(300, 300))
         .then((bytes) {
       if (mounted && bytes != null) setState(() => _thumb = bytes);
+    }).catchError((Object _) {
+      // The asset may have just been deleted from the device.
     });
   }
 

@@ -23,6 +23,39 @@ class FileIndex {
   /// An empty index, used the first time the app runs on an account.
   factory FileIndex.empty() => const FileIndex();
 
+  /// Merges independently-evolved index snapshots into one — recovery for
+  /// when [IndexService.load] lost track of the real index mid-session and
+  /// started fresh empty ones on top of it instead of finding it (see
+  /// [IndexService.findAllIndexSnapshots]). Folders/files are unioned by id;
+  /// each id was only ever added once across the fragmented lineages (never
+  /// edited independently in two of them), so last-write-wins is equivalent
+  /// to a true union. Albums additionally union their member file ids, in
+  /// case the same album gained different files in different lineages.
+  factory FileIndex.merge(Iterable<FileIndex> snapshots) {
+    final folders = <String, Folder>{};
+    final files = <String, FileItem>{};
+    final albums = <String, Album>{};
+    for (final snap in snapshots) {
+      for (final f in snap.folders) {
+        folders[f.id] = f;
+      }
+      for (final f in snap.files) {
+        files[f.id] = f;
+      }
+      for (final a in snap.albums) {
+        final existing = albums[a.id];
+        albums[a.id] = existing == null
+            ? a
+            : existing.copyWith(fileIds: {...existing.fileIds, ...a.fileIds}.toList());
+      }
+    }
+    return FileIndex(
+      folders: folders.values.toList(),
+      files: files.values.toList(),
+      albums: albums.values.toList(),
+    );
+  }
+
   factory FileIndex.fromJson(Map<String, dynamic> json) => FileIndex(
         version: json['version'] as int? ?? currentVersion,
         folders: (json['folders'] as List<dynamic>? ?? [])
@@ -85,6 +118,11 @@ class FileIndex {
       );
 
   FileIndex addFile(FileItem file) => copyWith(files: [...files, file]);
+
+  /// Adds several files at once — used by bulk uploads so the index is saved
+  /// to Telegram a single time per batch instead of once per file.
+  FileIndex addFiles(List<FileItem> newFiles) =>
+      copyWith(files: [...files, ...newFiles]);
 
   /// Removes a file from the vault and from every album that referenced it.
   FileIndex removeFile(String fileId) => copyWith(

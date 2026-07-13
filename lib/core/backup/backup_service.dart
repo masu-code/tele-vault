@@ -93,6 +93,7 @@ class BackupService {
         await addFile(fileItem);
         await registry.markUploaded(asset.id);
         await registry.linkLocalPath(fileItem.id, file.path);
+        await registry.linkFileItem(asset.id, fileItem.id);
       } catch (e) {
         debugPrint('BackupService: failed to upload ${asset.title}: $e');
       }
@@ -108,12 +109,17 @@ class BackupService {
     try {
       final permitted = await PhotoManager.requestPermissionExtend();
       if (!permitted.hasAccess) return [];
-      return PhotoManager.getAssetPathList(
+      final albums = await PhotoManager.getAssetPathList(
         type: RequestType.image | RequestType.video,
         filterOption: FilterOptionGroup(
           orders: [const OrderOption(type: OrderOptionType.createDate, asc: false)],
         ),
       );
+      // Exclude the virtual "Recent"/"all" album — it's just every real
+      // album combined, which duplicates what the Gallery tab already shows
+      // as one chronological timeline; listing it here too was confusing
+      // next to the actual per-folder albums (Camera, WhatsApp, etc.).
+      return albums.where((a) => !a.isAll).toList();
     } catch (e) {
       debugPrint('BackupService.deviceAlbums: $e');
       return [];

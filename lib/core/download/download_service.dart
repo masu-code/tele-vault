@@ -50,9 +50,18 @@ class DownloadService {
               ?.call(item.totalSize == 0 ? 1 : (baseOffset + n) / item.totalSize),
         );
       }
-    } finally {
+    } catch (e) {
       await sink.close();
+      // Delete rather than leave a partial file behind: downloadToCache's
+      // completeness check only compares length to totalSize, so a
+      // half-written file that happens to reach that length anyway (a range
+      // failed in the middle while later ranges still got written, pushing
+      // the file's length past the hole) would otherwise be silently served
+      // as "complete" forever on every future retry.
+      if (await out.exists()) await out.delete();
+      rethrow;
     }
+    await sink.close();
     return out;
   }
 
@@ -74,48 +83,62 @@ class DownloadService {
     var nextIndex = 0;
     var completed = 0;
     var writeLock = Future<void>.value();
+    // Future.wait below defaults to eagerError: false, so it waits for every
+    // worker to finish before throwing — if left unchecked, the other 3
+    // workers would keep fetching and writing ranges after one fails,
+    // extending the file past the failed range's hole and potentially past
+    // the point where its length matches totalSize, so the completeness
+    // check would treat the corrupted file as valid forever. Recording the
+    // first failure here and having every worker bail out on it stops that.
+    Object? failure;
 
     Future<void> worker() async {
-      while (true) {
+      while (failure == null) {
         final i = nextIndex;
         if (i >= ranges.length) return;
         nextIndex++;
         final range = ranges[i];
 
-        final result = await TelegramService.instance.call((c) => c.upload.getFile(
-          precise: false,
-          cdnSupported: false,
-          location: location,
-          offset: range.offset,
-          limit: range.limit,
-        ));
-        if (result.error != null) {
-          throw DownloadException('getFile failed: ${result.error!.errorMessage}');
-        }
-        final file = result.result;
-        if (file is! t.UploadFile) {
-          throw DownloadException('Unexpected getFile response type.');
-        }
-        final bytes = file.bytes;
-        if (bytes.isEmpty) continue;
-
-        final prior = writeLock;
-        final done = Completer<void>();
-        writeLock = done.future;
-        await prior;
         try {
-          await sink.setPosition(baseOffset + range.offset);
-          await sink.writeFrom(bytes);
-        } finally {
-          done.complete();
-        }
+          final result = await TelegramService.instance.call((c) => c.upload.getFile(
+            precise: false,
+            cdnSupported: false,
+            location: location,
+            offset: range.offset,
+            limit: range.limit,
+          ));
+          if (result.error != null) {
+            throw DownloadException('getFile failed: ${result.error!.errorMessage}');
+          }
+          final file = result.result;
+          if (file is! t.UploadFile) {
+            throw DownloadException('Unexpected getFile response type.');
+          }
+          final bytes = file.bytes;
+          if (bytes.isEmpty) continue;
 
-        completed += bytes.length;
-        onChunk?.call(completed);
+          final prior = writeLock;
+          final done = Completer<void>();
+          writeLock = done.future;
+          await prior;
+          try {
+            await sink.setPosition(baseOffset + range.offset);
+            await sink.writeFrom(bytes);
+          } finally {
+            done.complete();
+          }
+
+          completed += bytes.length;
+          onChunk?.call(completed);
+        } catch (e) {
+          failure ??= e;
+          return;
+        }
       }
     }
 
     await Future.wait(List.generate(concurrency, (_) => worker()));
+    if (failure != null) throw failure!;
     return completed;
   }
 

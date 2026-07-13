@@ -1,22 +1,30 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:visibility_detector/visibility_detector.dart';
 import '../../../core/thumbnail/thumbnail_service.dart';
-import '../../../models/file_item.dart';
+import '../models/gallery_entry.dart';
 
-/// A square gallery cell. Its thumbnail is requested only once the cell scrolls
-/// into view and cancelled when it scrolls out, so a large gallery loads just
-/// what's on screen. Supports a selected state for multi-select.
+/// A square gallery cell. Its thumbnail is requested in [initState] and
+/// cancelled in [dispose] — the surrounding `SliverGrid` already builds and
+/// destroys tiles lazily based on the viewport (plus `cacheExtent`), so that
+/// lifecycle alone is enough to load only what's near-screen; no separate
+/// visibility-polling package is needed on top of it. Supports a selected
+/// state for multi-select.
+///
+/// Renders either a cloud [GalleryEntry.fileItem] (preferred when both are
+/// present — cache/pool-managed by [ThumbnailService], independent of whether
+/// the device copy still exists) or a device-only [GalleryEntry.asset]
+/// (also cache/pool-managed by [ThumbnailService], via `localThumbnailFor`).
 class GalleryTile extends StatefulWidget {
   const GalleryTile({
     super.key,
-    required this.file,
+    required this.entry,
     required this.onTap,
     required this.onLongPress,
     this.selected = false,
   });
 
-  final FileItem file;
+  final GalleryEntry entry;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
   final bool selected;
@@ -26,44 +34,64 @@ class GalleryTile extends StatefulWidget {
 }
 
 class _GalleryTileState extends State<GalleryTile> {
-  File? _thumb;
-  bool _requested = false;
+  File? _cloudThumb;
+  Uint8List? _localThumb;
   bool _done = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _request();
+  }
 
   @override
   void didUpdateWidget(GalleryTile oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // If this cell is recycled for a different file, reload its thumbnail.
-    if (oldWidget.file.id != widget.file.id) {
+    // If this cell is recycled for a different entry, reload its thumbnail.
+    if (oldWidget.entry.key != widget.entry.key) {
+      _cancel(oldWidget.entry);
       setState(() {
-        _thumb = null;
-        _requested = false;
+        _cloudThumb = null;
+        _localThumb = null;
         _done = false;
       });
       _request();
     }
   }
 
+  @override
+  void dispose() {
+    _cancel(widget.entry);
+    super.dispose();
+  }
+
+  void _cancel(GalleryEntry entry) {
+    // Cancellation only applies to the cloud path — ThumbnailService's
+    // pool/cancel machinery exists for Telegram network fetches. Local
+    // thumbnails are cheap/cached, so an in-flight one is left to finish and
+    // populate the cache for next time rather than aborted.
+    if (!_done && entry.fileItem != null) {
+      ThumbnailService.instance.cancel(entry.fileItem!.id);
+    }
+  }
+
   void _request() {
-    _requested = true;
-    ThumbnailService.instance.thumbnailFor(widget.file).then((f) {
-      if (mounted) setState(() { _thumb = f; _done = true; });
-    });
+    final fileItem = widget.entry.fileItem;
+    if (fileItem != null) {
+      ThumbnailService.instance.thumbnailFor(fileItem).then((f) {
+        if (mounted) setState(() { _cloudThumb = f; _done = true; });
+      });
+    } else {
+      ThumbnailService.instance.localThumbnailFor(widget.entry.asset!).then((data) {
+        if (mounted) setState(() { _localThumb = data; _done = true; });
+      });
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final isVideo = widget.file.mimeType.startsWith('video/');
-    return VisibilityDetector(
-      key: Key('gtile_${widget.file.id}'),
-      onVisibilityChanged: (info) {
-        if (!mounted) return;
-        if (info.visibleFraction == 0) {
-          if (!_done) ThumbnailService.instance.cancel(widget.file.id);
-        } else if (!_requested) {
-          _request();
-        }
-      },
+    final entry = widget.entry;
+    return RepaintBoundary(
       child: GestureDetector(
         onTap: widget.onTap,
         onLongPress: widget.onLongPress,
@@ -73,14 +101,21 @@ class _GalleryTileState extends State<GalleryTile> {
           child: Stack(
             fit: StackFit.expand,
             children: [
-              if (_thumb != null)
+              if (_cloudThumb != null)
                 Image.file(
-                  _thumb!,
+                  _cloudThumb!,
                   fit: BoxFit.cover,
                   cacheWidth: 300,
-                  errorBuilder: (_, _, _) => _placeholder(isVideo),
+                  errorBuilder: (_, _, _) => _placeholder(entry.isVideo),
                 )
-              else if (_requested && !_done)
+              else if (_localThumb != null)
+                Image.memory(
+                  _localThumb!,
+                  fit: BoxFit.cover,
+                  cacheWidth: 300,
+                  errorBuilder: (_, _, _) => _placeholder(entry.isVideo),
+                )
+              else if (!_done)
                 const Center(
                   child: SizedBox(
                     width: 20, height: 20,
@@ -88,10 +123,24 @@ class _GalleryTileState extends State<GalleryTile> {
                   ),
                 )
               else
-                _placeholder(isVideo),
-              if (isVideo && !widget.selected)
+                _placeholder(entry.isVideo),
+              if (entry.isVideo && !widget.selected)
                 const Align(
                   child: Icon(Icons.play_circle_fill, color: Colors.white70, size: 32),
+                ),
+              // Subtle cloud badge — the only status shown on the tile itself
+              // (no separate "on device" icon here, unlike the single-item
+              // viewer's two independent indicators).
+              if (entry.isUploaded && !widget.selected)
+                const Positioned(
+                  top: 4,
+                  right: 4,
+                  child: Icon(
+                    Icons.cloud_done_outlined,
+                    size: 14,
+                    color: Colors.white70,
+                    shadows: [Shadow(color: Colors.black87, blurRadius: 3)],
+                  ),
                 ),
               if (widget.selected) ...[
                 Container(color: const Color(0x662AABEE)),

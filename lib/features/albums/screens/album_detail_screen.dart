@@ -4,6 +4,7 @@ import '../../../core/local_storage/local_file_service.dart';
 import '../../download/providers/download_provider.dart';
 import '../../explorer/providers/index_provider.dart';
 import '../../explorer/widgets/save_to_device_button.dart';
+import '../../gallery/models/gallery_entry.dart';
 import '../../gallery/widgets/gallery_tile.dart';
 import '../../preview/screens/media_viewer_screen.dart';
 import '../../../models/file_item.dart';
@@ -88,6 +89,13 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
       }
     });
+    ref.listen(indexProvider, (prev, next) {
+      if (next.mutationError != null && next.mutationError != prev?.mutationError) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Action failed: ${next.mutationError}')),
+        );
+      }
+    });
 
     final allSaved =
         _selected.isNotEmpty && _selected.every((id) => _savedIds.contains(id));
@@ -98,6 +106,22 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
               leading: IconButton(icon: const Icon(Icons.close), onPressed: _exitSelection),
               title: Text('${_selected.length} selected'),
               actions: [
+                IconButton(
+                  icon: const Icon(Icons.share_outlined),
+                  tooltip: 'Share',
+                  onPressed: () => shareCloudFiles(
+                    context,
+                    items.where((f) => _selected.contains(f.id)).toList(),
+                  ),
+                ),
+                // Cloud-backup status: always uploaded here — informational.
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 12),
+                  child: Center(
+                    child: Icon(Icons.cloud_done_outlined, color: Color(0xFF2AABEE)),
+                  ),
+                ),
+                // Device-presence status: Download (pending) or On device (done).
                 if (allSaved)
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -108,7 +132,7 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
                 else
                   IconButton(
                     icon: const Icon(Icons.download_outlined),
-                    tooltip: 'Save to device',
+                    tooltip: 'Download',
                     onPressed: () => _saveSelected(items),
                   ),
                 IconButton(
@@ -136,7 +160,7 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
                 final file = items[i];
                 return GalleryTile(
                   key: ValueKey(file.id),
-                  file: file,
+                  entry: GalleryEntry(fileItem: file),
                   selected: _selected.contains(file.id),
                   onLongPress: () => _selecting ? _toggle(file) : _startSelection(file),
                   onTap: () {

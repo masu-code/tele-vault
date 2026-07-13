@@ -1,9 +1,14 @@
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:photo_manager/photo_manager.dart';
+import '../../../core/backup/backup_registry.dart';
+import '../../../core/backup/device_state_bus.dart';
+import '../../../core/local_storage/local_file_service.dart';
 import '../../download/providers/download_provider.dart';
-import '../../preview/screens/image_preview_screen.dart';
-import '../../preview/screens/video_preview_screen.dart';
+import '../../preview/screens/media_viewer_screen.dart';
+import '../../preview/widgets/delete_source_dialog.dart';
+import '../../profile/widgets/floating_profile_header.dart';
 import '../../upload/providers/upload_provider.dart';
 import '../../../models/file_index.dart';
 import '../../../models/file_item.dart';
@@ -61,13 +66,9 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
   /// Images and videos preview in-app; everything else opens with the system.
   void _openFile(FileItem file) {
     final mime = file.mimeType;
-    if (mime.startsWith('image/')) {
+    if (mime.startsWith('image/') || mime.startsWith('video/')) {
       Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => ImagePreviewScreen(file: file)),
-      );
-    } else if (mime.startsWith('video/')) {
-      Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => VideoPreviewScreen(file: file)),
+        MaterialPageRoute(builder: (_) => MediaViewerScreen(items: [file], initialIndex: 0)),
       );
     } else {
       ref.read(downloadProvider.notifier).openWithSystem(file);
@@ -182,26 +183,42 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
   Future<void> _deleteSelected(FileIndex index) async {
     final files = index.files.where((f) => _selFiles.contains(f.id)).toList();
     final folderIds = _selFolders.toList();
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('Delete $_selCount item(s)?'),
-        content: const Text(
-          'Files are permanently removed from Telegram. Folders are removed and '
-          'their contents moved to the root. This cannot be undone.',
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true) return;
-    await ref.read(indexProvider.notifier).deleteItems(files, folderIds);
+    if (files.isEmpty && folderIds.isEmpty) return;
+
+    final registry = BackupRegistry.instance;
+    // Same lookup the on-device icon uses — checking BackupRegistry.localPathFor
+    // alone misses files saved via the explicit "Save to device" download.
+    final matches = await Future.wait(files.map(LocalFileService.instance.existingLocalFile));
+    final anyOnDevice = matches.any((m) => m != null);
+    if (!mounted) return;
+
+    final source = await askDeleteSource(context, existsOnDevice: anyOnDevice, existsInCloud: true);
+    if (source == null) return;
+
+    if (source == DeleteSource.cloud || source == DeleteSource.both) {
+      await ref.read(indexProvider.notifier).deleteItems(files, folderIds);
+    } else if (folderIds.isNotEmpty) {
+      // Device-only: keep the cloud files, just remove selected folders.
+      await ref.read(indexProvider.notifier).deleteItems([], folderIds);
+    }
+    if (source == DeleteSource.device || source == DeleteSource.both) {
+      final assetIds = <String>[];
+      for (var i = 0; i < files.length; i++) {
+        final match = matches[i];
+        if (match == null) continue;
+        if (match.isLinkedAsset) {
+          final id = registry.assetIdForFileItem(files[i].id);
+          if (id != null) assetIds.add(id);
+        } else {
+          await match.file.delete();
+        }
+      }
+      if (assetIds.isNotEmpty) {
+        await PhotoManager.editor.deleteWithIds(assetIds);
+        await PhotoManager.clearFileCache();
+      }
+    }
+    bumpDeviceState(ref);
     _exitSelection();
   }
 
@@ -220,6 +237,13 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
         );
       }
     });
+    ref.listen(indexProvider, (prev, next) {
+      if (next.mutationError != null && next.mutationError != prev?.mutationError) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Action failed: ${next.mutationError}')),
+        );
+      }
+    });
     ref.listen(downloadProvider, (prev, next) {
       if (next.error != null && next.error != prev?.error) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed: ${next.error}')));
@@ -229,8 +253,11 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
       }
     });
 
+    final atRoot = _path.isEmpty;
+    final topInset = MediaQuery.of(context).padding.top + kToolbarHeight;
+
     return Scaffold(
-      appBar: _selecting ? _selectionAppBar(index) : _normalAppBar(state),
+      appBar: _selecting ? _selectionAppBar(index) : null,
       floatingActionButton: _selecting
           ? null
           : Column(
@@ -253,38 +280,41 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
                 ),
               ],
             ),
-      body: DropTarget(
-        onDragDone: (detail) {
-          final paths = detail.files.map((f) => f.path).toList();
-          ref.read(uploadProvider.notifier).uploadPaths(paths, folderId: _currentFolderId);
-        },
-        child: Column(
-          children: [
-            if (_path.isNotEmpty) _breadcrumb(),
-            if (upload.isUploading) _uploadBanner(upload),
-            Expanded(child: _buildBody(state, folders, files)),
-          ],
-        ),
-      ),
-    );
-  }
-
-  PreferredSizeWidget _normalAppBar(IndexState state) {
-    final atRoot = _path.isEmpty;
-    return AppBar(
-      leading: atRoot ? null : IconButton(icon: const Icon(Icons.arrow_back), onPressed: _goUp),
-      title: Text(atRoot ? 'TeleVault' : _path.last.name),
-      actions: [
-        if (state.isSaving)
-          const Padding(
-            padding: EdgeInsets.all(16),
-            child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+      body: Stack(
+        children: [
+          DropTarget(
+            onDragDone: (detail) {
+              final paths = detail.files.map((f) => f.path).toList();
+              ref.read(uploadProvider.notifier).uploadPaths(paths, folderId: _currentFolderId);
+            },
+            child: Column(
+              children: [
+                SizedBox(height: _selecting ? 0 : topInset),
+                if (_path.isNotEmpty) _breadcrumb(),
+                if (upload.isUploading) _uploadBanner(upload),
+                Expanded(child: _buildBody(state, folders, files)),
+              ],
+            ),
           ),
-        IconButton(
-          icon: const Icon(Icons.refresh),
-          onPressed: () => ref.read(indexProvider.notifier).load(),
-        ),
-      ],
+          if (!_selecting)
+            FloatingProfileHeader(
+              title: atRoot ? 'Files' : _path.last.name,
+              onBack: atRoot ? null : _goUp,
+              actions: [
+                if (state.isSaving)
+                  const Padding(
+                    padding: EdgeInsets.all(16),
+                    child: SizedBox(
+                        width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                  ),
+                IconButton(
+                  icon: const Icon(Icons.refresh),
+                  onPressed: () => ref.read(indexProvider.notifier).load(),
+                ),
+              ],
+            ),
+        ],
+      ),
     );
   }
 
@@ -304,12 +334,21 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
           tooltip: 'Move to folder',
           onPressed: () => _moveSelected(index),
         ),
-        if (_selFiles.isNotEmpty)
+        if (_selFiles.isNotEmpty) ...[
+          IconButton(
+            icon: const Icon(Icons.share_outlined),
+            tooltip: 'Share',
+            onPressed: () => shareCloudFiles(
+              context,
+              index.filesByIds(_selFiles.toList()),
+            ),
+          ),
           IconButton(
             icon: const Icon(Icons.download_outlined),
             tooltip: 'Save to device',
             onPressed: () => _saveSelected(index),
           ),
+        ],
         IconButton(
           icon: const Icon(Icons.delete_outline),
           tooltip: 'Delete',

@@ -3,6 +3,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
 import '../../../core/backup/backup_registry.dart';
+import '../../../core/backup/device_state_bus.dart';
 import '../../../core/upload/upload_service.dart';
 import '../../explorer/providers/index_provider.dart';
 
@@ -73,7 +74,18 @@ class UploadNotifier extends StateNotifier<UploadState> {
           onProgress: (pr) => state = state.copyWith(progress: pr),
         );
         await _ref.read(indexProvider.notifier).addFile(item);
+        // addFile never throws on failure — it rolls back silently and only
+        // sets mutationError on the index state. Without this check, a file
+        // that finished uploading to Telegram but failed to save into the
+        // index would report success here: the progress bar would complete
+        // and move to the next file, while this one silently never appears
+        // anywhere in the app despite already consuming Telegram storage.
+        final indexError = _ref.read(indexProvider).mutationError;
+        if (indexError != null) {
+          throw Exception('Uploaded but failed to save to index: $indexError');
+        }
         await BackupRegistry.instance.linkLocalPath(item.id, paths[i]);
+        bumpDeviceState(_ref);
       } catch (e) {
         state = state.copyWith(isUploading: false, error: 'Failed on $name: $e');
         return;

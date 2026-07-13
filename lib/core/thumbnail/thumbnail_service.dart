@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:image/image.dart' as img;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:photo_manager/photo_manager.dart';
 import 'package:pool/pool.dart';
 import 'package:t/t.dart' as t;
 import '../../models/file_item.dart';
@@ -43,6 +44,14 @@ class ThumbnailService {
   final Map<String, File?> _mem = {};
   final Map<String, Future<File?>> _inflight = {};
   final Set<String> _cancelled = {};
+
+  // Separate pool for device-asset thumbnails: a platform-channel + native
+  // decode call, not a network fetch, so it doesn't compete with Telegram's
+  // 4 download slots above — a faster local resource gets its own budget.
+  static const int _maxConcurrentLocal = 6;
+  final Pool _localPool = Pool(_maxConcurrentLocal);
+  final Map<String, Uint8List?> _localMem = {};
+  final Map<String, Future<Uint8List?>> _localInflight = {};
 
   Directory? _dir;
 
@@ -104,6 +113,29 @@ class ThumbnailService {
     if (bytes == null) return null;
     await onDisk.writeAsBytes(bytes);
     return onDisk;
+  }
+
+  /// Returns thumbnail bytes for a device [asset], cached in memory and
+  /// deduped/pooled the same way as [thumbnailFor] — the Gallery timeline is
+  /// now mostly device photos, and without this every tile scrolling into
+  /// view called photo_manager directly with no cache and no concurrency
+  /// limit at all.
+  Future<Uint8List?> localThumbnailFor(AssetEntity asset) async {
+    if (_localMem.containsKey(asset.id)) return _localMem[asset.id];
+
+    return _localInflight.putIfAbsent(asset.id, () async {
+      try {
+        final bytes = await _localPool.withResource(
+          () => asset.thumbnailDataWithSize(const ThumbnailSize(200, 200)),
+        );
+        _localMem[asset.id] = bytes;
+        return bytes;
+      } catch (_) {
+        return null;
+      } finally {
+        _localInflight.remove(asset.id);
+      }
+    });
   }
 
   /// Fetches Telegram's embedded thumbnail (a PhotoSize) for the file's first

@@ -1,8 +1,10 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_filex/open_filex.dart';
+import '../../../core/backup/device_state_bus.dart';
 import '../../../core/download/download_service.dart';
 import '../../../core/local_storage/local_file_service.dart';
 import '../../../models/file_item.dart';
+import '../../backup/providers/backup_provider.dart';
 
 class DownloadState {
   /// Id of the file currently being fetched/saved, or null when idle.
@@ -22,7 +24,9 @@ class DownloadState {
 }
 
 class DownloadNotifier extends StateNotifier<DownloadState> {
-  DownloadNotifier() : super(const DownloadState());
+  DownloadNotifier(this._ref) : super(const DownloadState());
+
+  final Ref _ref;
 
   /// Opens [item] with the system's default handler. Brought into the app cache
   /// transparently (reused on later opens) — the automatic "view" path.
@@ -44,11 +48,15 @@ class DownloadNotifier extends StateNotifier<DownloadState> {
   Future<void> saveToDevice(FileItem item) async {
     state = DownloadState(fileId: item.id);
     try {
-      final saved = await LocalFileService.instance.save(
+      await LocalFileService.instance.save(
         item,
         onProgress: (pr) => state = state.withProgress(item.id, pr),
       );
-      state = DownloadState(savedMessage: 'Saved to ${saved.path}');
+      // The save may have just created the "TeleVault" device album — the
+      // Albums tab won't show it until the device-album list is re-fetched.
+      await _ref.read(backupProvider.notifier).refreshDeviceAlbums();
+      bumpDeviceState(_ref);
+      state = const DownloadState(savedMessage: 'Saved to device — see the TeleVault album');
     } catch (e) {
       state = DownloadState(error: e.toString());
     }
@@ -72,11 +80,22 @@ class DownloadNotifier extends StateNotifier<DownloadState> {
         );
         saved++;
       }
+      if (saved > 0) {
+        await _ref.read(backupProvider.notifier).refreshDeviceAlbums();
+        bumpDeviceState(_ref);
+      }
       final msg = saved == 0
           ? 'Already on device'
-          : 'Saved $saved to device${skipped > 0 ? ' ($skipped already saved)' : ''}';
+          : 'Saved $saved to device (TeleVault album)${skipped > 0 ? ' ($skipped already saved)' : ''}';
       state = DownloadState(savedMessage: msg);
     } catch (e) {
+      // Files saved before the failing one are already on disk — without
+      // this, their "on device" indicators would stay stale until an
+      // unrelated action elsewhere happens to bump the state.
+      if (saved > 0) {
+        await _ref.read(backupProvider.notifier).refreshDeviceAlbums();
+        bumpDeviceState(_ref);
+      }
       state = DownloadState(error: 'Saved $saved of ${items.length}; failed: $e');
     }
   }
@@ -84,4 +103,4 @@ class DownloadNotifier extends StateNotifier<DownloadState> {
 }
 
 final downloadProvider =
-    StateNotifierProvider<DownloadNotifier, DownloadState>((_) => DownloadNotifier());
+    StateNotifierProvider<DownloadNotifier, DownloadState>((ref) => DownloadNotifier(ref));
