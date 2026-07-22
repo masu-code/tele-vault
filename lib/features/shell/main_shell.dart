@@ -1,9 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:photo_manager/photo_manager.dart';
 import '../../core/backup/background_execution_service.dart';
-import '../../core/backup/backup_registry.dart';
 import '../albums/screens/albums_screen.dart';
 import '../backup/providers/backup_provider.dart';
 import '../explorer/providers/index_provider.dart';
@@ -28,12 +26,6 @@ class _MainShellState extends ConsumerState<MainShell> {
   /// after startup. Not wired to any UI; normal builds leave it off.
   static const _autoUpload = String.fromEnvironment('TV_AUTO_UPLOAD') == '1';
 
-  /// One-time cleanup hook: with --dart-define=TV_FIX_ORPHANS=1, clears the
-  /// "uploaded" flag on any registry entry whose linked file isn't actually
-  /// present in the just-loaded index — see [BackupRegistry.clearUploaded].
-  /// Cheap (no network scan beyond the normal index load), safe to run once.
-  static const _fixOrphans = String.fromEnvironment('TV_FIX_ORPHANS') == '1';
-
   static const _tabs = [GalleryScreen(), AlbumsScreen(), ExplorerScreen()];
 
   @override
@@ -57,35 +49,7 @@ class _MainShellState extends ConsumerState<MainShell> {
         final n = await ref.read(backupProvider.notifier).uploadAllPending();
         debugPrint('TVQUEUE: auto-upload enqueued $n pending item(s)');
       }
-      if (_fixOrphans) await _fixOrphanedRegistryLinks();
     });
-  }
-
-  Future<void> _fixOrphanedRegistryLinks() async {
-    final registry = BackupRegistry.instance;
-    final cloudIds = ref.read(indexProvider).index.files.map((f) => f.id).toSet();
-    var cleared = 0;
-    for (final assetId in registry.uploadedAssetIds) {
-      final fileItemId = registry.fileItemIdFor(assetId);
-      final isOrphan = fileItemId == null || !cloudIds.contains(fileItemId);
-      if (!isOrphan) continue;
-
-      String label = assetId;
-      try {
-        final asset = await AssetEntity.fromId(assetId);
-        if (asset != null) {
-          label = '${asset.title ?? assetId} (created ${asset.createDateTime})';
-        }
-      } catch (_) {}
-      debugPrint('TVDIAG: orphan asset=$assetId title=$label '
-          'fileItemId=${fileItemId ?? "none"} '
-          'reason=${fileItemId == null ? "never linked to a file" : "linked file not found in any index snapshot"}');
-
-      await registry.clearUploaded(assetId);
-      cleared++;
-    }
-    debugPrint('TVDIAG: orphan cleanup done — cleared=$cleared '
-        'remainingUploaded=${registry.uploadedAssetIds.length}');
   }
 
   @override

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:t/t.dart' as t;
 import '../../models/file_index.dart';
 import '../../models/file_item.dart';
@@ -26,6 +27,8 @@ class IndexService {
 
   static const String _marker = 'TELEVAULT_INDEX_V1';
   static const String _fileName = 'televault_index.json';
+  static const String _persistedMsgIdKey = 'tv_index_msg_id';
+  static const String _persistedLegacyKey = 'tv_index_msg_legacy';
 
   /// Message id of the current index message, once known.
   int? _messageId;
@@ -40,20 +43,59 @@ class IndexService {
   /// to persist once so it gets rewritten as a document.
   bool get needsMigration => _legacy;
 
-  /// Loads the index, scanning the most recent Saved Messages for the tagged
-  /// message. Returns an empty index if none exists yet.
+  /// Remembers [_messageId] on-device so future [load] calls can jump
+  /// straight to it (see [load]'s doc comment for why this matters) instead
+  /// of depending on it still being within the most recent history window.
+  Future<void> _persistMessageId() async {
+    final prefs = await SharedPreferences.getInstance();
+    final id = _messageId;
+    if (id == null) {
+      await prefs.remove(_persistedMsgIdKey);
+      await prefs.remove(_persistedLegacyKey);
+    } else {
+      await prefs.setInt(_persistedMsgIdKey, id);
+      await prefs.setBool(_persistedLegacyKey, _legacy);
+    }
+  }
+
+  /// Loads the index. Returns an empty index if none exists yet.
   ///
-  /// Only checks the most recent page (100 messages) — this runs on every
-  /// cold start and must stay fast even on an account with years of
-  /// unrelated Saved Messages history; a full scan here previously froze the
-  /// main isolate long enough to trigger Android's "not responding" dialog.
-  /// The known gap: every uploaded file also posts its own message into this
-  /// same peer, so if the app process restarts after ~100+ files have been
-  /// uploaded since the index was last touched, this won't find it and
-  /// treats the vault as empty — see [findAllIndexSnapshots] for the
-  /// recovery tool that reunites index snapshots orphaned that way (run
-  /// deliberately, off the main isolate, not from here).
+  /// Every uploaded file posts its own message into the same Saved Messages
+  /// peer the index document lives in, so re-finding it by scanning history
+  /// gets more expensive — and eventually falls outside any fixed-size
+  /// window — the more files a vault has. A full scan is also not safe to do
+  /// on every cold start regardless of size: it previously froze the main
+  /// isolate long enough to trigger Android's "not responding" dialog on an
+  /// account with a lot of unrelated Saved Messages history.
+  ///
+  /// So the real lookup is by remembered message id (persisted locally after
+  /// every successful [load]/[save]) via a direct, O(1) `messages.getMessages`
+  /// call — no scanning at all, regardless of how much history exists. Only
+  /// a fresh install (nothing persisted yet) or a persisted id that no longer
+  /// resolves (e.g. the message was manually deleted in Telegram) falls back
+  /// to scanning the most recent 100 messages. That fallback missing an
+  /// index that's fallen further back than that is the known gap it doesn't
+  /// close by itself — see [findAllIndexSnapshots] for the recovery tool.
   Future<FileIndex> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final persistedId = prefs.getInt(_persistedMsgIdKey);
+    if (persistedId != null) {
+      final result = await TelegramService.instance.call((c) => c.messages.getMessages(
+        id: [t.InputMessageID(id: persistedId)],
+      ));
+      if (result.error == null) {
+        for (final msg in extractMessages(result.result)) {
+          if (msg is t.Message && msg.message.startsWith(_marker)) {
+            return _decodeFoundMessage(msg);
+          }
+        }
+      }
+      // Stale — the message is gone or never was what we expected. Clear it
+      // so we don't keep retrying a dead id, and fall through to scanning.
+      await prefs.remove(_persistedMsgIdKey);
+      await prefs.remove(_persistedLegacyKey);
+    }
+
     final result = await TelegramService.instance.call((c) => c.messages.getHistory(
       peer: const t.InputPeerSelf(),
       offsetId: 0,
@@ -69,37 +111,45 @@ class IndexService {
     }
 
     for (final msg in extractMessages(result.result)) {
-      if (msg is! t.Message || !msg.message.startsWith(_marker)) continue;
-
-      final media = msg.media;
-      if (media is t.MessageMediaDocument && media.document is t.Document) {
-        // Current format: index stored as a document.
-        _messageId = msg.id;
-        _legacy = false;
-        final bytes = await _downloadDocument(media.document as t.Document);
-        final raw = utf8.decode(bytes);
-        try {
-          return FileIndex.decode(raw);
-        } catch (e) {
-          throw IndexException('Index document is corrupt: $e');
-        }
-      } else {
-        // Legacy format: JSON inline after the marker in a text message.
-        _messageId = msg.id;
-        _legacy = true;
-        final payload = msg.message.substring(_marker.length).trimLeft();
-        if (payload.isEmpty) return FileIndex.empty();
-        try {
-          return FileIndex.decode(payload);
-        } catch (e) {
-          throw IndexException('Legacy index message is corrupt: $e');
-        }
+      if (msg is t.Message && msg.message.startsWith(_marker)) {
+        return _decodeFoundMessage(msg);
       }
     }
 
     _messageId = null;
     _legacy = false;
     return FileIndex.empty();
+  }
+
+  /// Decodes an index message found by either lookup path in [load], setting
+  /// (and persisting) [_messageId]/[_legacy] as a side effect.
+  Future<FileIndex> _decodeFoundMessage(t.Message msg) async {
+    final media = msg.media;
+    if (media is t.MessageMediaDocument && media.document is t.Document) {
+      // Current format: index stored as a document.
+      _messageId = msg.id;
+      _legacy = false;
+      await _persistMessageId();
+      final bytes = await _downloadDocument(media.document as t.Document);
+      final raw = utf8.decode(bytes);
+      try {
+        return FileIndex.decode(raw);
+      } catch (e) {
+        throw IndexException('Index document is corrupt: $e');
+      }
+    } else {
+      // Legacy format: JSON inline after the marker in a text message.
+      _messageId = msg.id;
+      _legacy = true;
+      await _persistMessageId();
+      final payload = msg.message.substring(_marker.length).trimLeft();
+      if (payload.isEmpty) return FileIndex.empty();
+      try {
+        return FileIndex.decode(payload);
+      } catch (e) {
+        throw IndexException('Legacy index message is corrupt: $e');
+      }
+    }
   }
 
   /// Persists [index] as a JSON document. Edits the existing index document in
@@ -163,6 +213,7 @@ class IndexService {
     }
     _messageId = extractSentMessageId(result.result, randomId);
     _legacy = false;
+    await _persistMessageId();
 
     // Remove the superseded legacy text message so load() won't see two.
     if (staleId != null) {
