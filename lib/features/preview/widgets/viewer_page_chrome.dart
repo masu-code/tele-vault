@@ -72,6 +72,16 @@ class _ViewerPageChromeState extends State<ViewerPageChrome>
   late final AnimationController _snapController;
   Animation<double>? _snapAnimation;
 
+  /// Live count of fingers currently touching the screen. A second pointer
+  /// touching down means this is a pinch, not a tap/vertical-drag — disabling
+  /// this widget's own gesture recognizers the instant that happens (rather
+  /// than waiting for [widget.gestureDisabled], which only flips once the
+  /// child's InteractiveViewer has *already* registered a scale) stops them
+  /// from winning the gesture arena race against InteractiveViewer's scale
+  /// recognizer in the first place — without this, starting a pinch could
+  /// get eaten as a vertical drag before zooming ever had a chance to begin.
+  int _activePointers = 0;
+
   @override
   void initState() {
     super.initState();
@@ -128,12 +138,22 @@ class _ViewerPageChromeState extends State<ViewerPageChrome>
             Expanded(
               child: ValueListenableBuilder<bool>(
                 valueListenable: widget.gestureDisabled ?? _neverDisabled,
-                builder: (context, disabled, child) => GestureDetector(
-                  onTap: disabled ? null : _onTap,
-                  onVerticalDragUpdate: disabled ? null : _onVerticalDragUpdate,
-                  onVerticalDragEnd: disabled ? null : _onVerticalDragEnd,
-                  child: child,
-                ),
+                builder: (context, disabledByZoom, child) {
+                  final disabled = disabledByZoom || _activePointers >= 2;
+                  return Listener(
+                    onPointerDown: (_) => setState(() => _activePointers++),
+                    onPointerUp: (_) =>
+                        setState(() => _activePointers = (_activePointers - 1).clamp(0, 10)),
+                    onPointerCancel: (_) =>
+                        setState(() => _activePointers = (_activePointers - 1).clamp(0, 10)),
+                    child: GestureDetector(
+                      onTap: disabled ? null : _onTap,
+                      onVerticalDragUpdate: disabled ? null : _onVerticalDragUpdate,
+                      onVerticalDragEnd: disabled ? null : _onVerticalDragEnd,
+                      child: child,
+                    ),
+                  );
+                },
                 child: widget.child,
               ),
             ),

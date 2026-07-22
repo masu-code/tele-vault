@@ -2,6 +2,7 @@ import 'package:disk_space_plus/disk_space_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/format_utils.dart';
+import '../../backup/providers/backup_provider.dart';
 import '../../transfer/widgets/transfer_progress_bar.dart';
 import '../providers/profile_provider.dart';
 import 'free_up_storage_screen.dart';
@@ -60,6 +61,8 @@ class AccountSheet extends ConsumerWidget {
             const TransferProgressBar(),
             const SizedBox(height: 12),
             const _StorageCard(),
+            const SizedBox(height: 12),
+            const _MobileDataToggle(),
           ],
         ),
       ),
@@ -143,6 +146,39 @@ class _StorageCardState extends State<_StorageCard> {
               },
               child: const Text('Free up space'),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Lets the user opt in to running automatic backup (album auto-sync, and
+/// picking up new photos as they arrive) over mobile data — off by default,
+/// so it only runs on WiFi unless explicitly allowed here. Doesn't affect
+/// explicit actions like Gallery's own "Upload" button.
+class _MobileDataToggle extends ConsumerWidget {
+  const _MobileDataToggle();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final allowed = ref.watch(backupProvider).allowMobileData;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1C1C1E),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.signal_cellular_alt, size: 18, color: Color(0xFF2AABEE)),
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Text('Auto-backup with mobile data', style: TextStyle(fontSize: 14)),
+          ),
+          Switch(
+            value: allowed,
+            onChanged: (v) => ref.read(backupProvider.notifier).setAllowMobileData(v),
           ),
         ],
       ),

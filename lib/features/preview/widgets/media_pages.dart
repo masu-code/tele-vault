@@ -136,9 +136,17 @@ class _CloudVideoPageState extends ConsumerState<CloudVideoPage> {
   bool _ready = false;
   String? _error;
 
+  final TransformationController _transform = TransformationController();
+  // See _CloudImagePageState for why this exists.
+  final ValueNotifier<bool> _zoomed = ValueNotifier(false);
+
   @override
   void initState() {
     super.initState();
+    _transform.addListener(() {
+      final zoomed = _transform.value.getMaxScaleOnAxis() > 1.01;
+      if (zoomed != _zoomed.value) _zoomed.value = zoomed;
+    });
     _load();
   }
 
@@ -160,6 +168,8 @@ class _CloudVideoPageState extends ConsumerState<CloudVideoPage> {
   @override
   void dispose() {
     _player.dispose();
+    _transform.dispose();
+    _zoomed.dispose();
     super.dispose();
   }
 
@@ -176,7 +186,17 @@ class _CloudVideoPageState extends ConsumerState<CloudVideoPage> {
     return ViewerPageChrome(
       actions: cloudMediaActions(context, ref, widget.file),
       infoBuilder: (context) => cloudMediaInfo(widget.file),
-      child: Video(controller: _controller, controls: videoControlsWithSafeInsets),
+      gestureDisabled: _zoomed,
+      child: InteractiveViewer(
+        transformationController: _transform,
+        // Panning stays off for video: a single-finger drag needs to reach
+        // the seek bar/tap-to-toggle-controls underneath undisturbed. Pinch
+        // (scaleEnabled) still zooms in/out around the center.
+        panEnabled: false,
+        minScale: 1,
+        maxScale: 5,
+        child: Video(controller: _controller, controls: videoControlsWithSafeInsets),
+      ),
     );
   }
 }
@@ -400,9 +420,17 @@ class _LocalVideoPageState extends ConsumerState<LocalVideoPage> {
   String? _error;
   File? _local;
 
+  final TransformationController _transform = TransformationController();
+  // See _CloudImagePageState for why this exists.
+  final ValueNotifier<bool> _zoomed = ValueNotifier(false);
+
   @override
   void initState() {
     super.initState();
+    _transform.addListener(() {
+      final zoomed = _transform.value.getMaxScaleOnAxis() > 1.01;
+      if (zoomed != _zoomed.value) _zoomed.value = zoomed;
+    });
     _load();
   }
 
@@ -420,6 +448,8 @@ class _LocalVideoPageState extends ConsumerState<LocalVideoPage> {
   @override
   void dispose() {
     _player.dispose();
+    _transform.dispose();
+    _zoomed.dispose();
     super.dispose();
   }
 
@@ -435,7 +465,17 @@ class _LocalVideoPageState extends ConsumerState<LocalVideoPage> {
     return ViewerPageChrome(
       actions: localMediaActions(context, ref, widget.asset, local),
       infoBuilder: (context) => localMediaInfo(widget.asset, local),
-      child: Video(controller: _controller, controls: videoControlsWithSafeInsets),
+      gestureDisabled: _zoomed,
+      child: InteractiveViewer(
+        transformationController: _transform,
+        // Panning stays off for video: a single-finger drag needs to reach
+        // the seek bar/tap-to-toggle-controls underneath undisturbed. Pinch
+        // (scaleEnabled) still zooms in/out around the center.
+        panEnabled: false,
+        minScale: 1,
+        maxScale: 5,
+        child: Video(controller: _controller, controls: videoControlsWithSafeInsets),
+      ),
     );
   }
 }

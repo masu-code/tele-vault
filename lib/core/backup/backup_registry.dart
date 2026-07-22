@@ -9,6 +9,7 @@ class BackupRegistry {
   static const _linkPrefix = 'bk_link_';
   static const _fileItemPrefix = 'bk_item_';
   static const _assetForFileItemPrefix = 'bk_asset_';
+  static const _allowMobileDataKey = 'bk_allow_mobile_data';
 
   static final instance = BackupRegistry._();
   BackupRegistry._();
@@ -83,6 +84,16 @@ class BackupRegistry {
       await _prefs!.remove('$_uploadedPrefix$assetId');
     }
   }
+
+  /// Whether automatic backup (album auto-sync, and the on-device-change
+  /// watcher) is allowed to run over mobile data. Off by default — automatic
+  /// uploads only happen on WiFi unless the user opts in. Doesn't affect
+  /// explicit user actions (e.g. tapping "Upload" in Gallery), only the
+  /// automatic paths in [BackupNotifier].
+  bool get allowMobileData => _prefs!.getBool(_allowMobileDataKey) ?? false;
+
+  Future<void> setAllowMobileData(bool value) =>
+      _prefs!.setBool(_allowMobileDataKey, value);
 
   List<String> get enabledAlbumIds =>
       _prefs!.getStringList(_enabledKey) ?? [];
