@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:photo_manager/photo_manager.dart';
 import '../../../core/backup/backup_registry.dart';
 import '../../../core/backup/backup_service.dart';
+import '../../../core/backup/device_state_bus.dart';
 import '../../transfer/providers/transfer_queue_provider.dart';
 
 class BackupState {
@@ -120,7 +121,16 @@ class BackupNotifier extends StateNotifier<BackupState> {
       // Multiple assets can land in one burst (e.g. a batch WhatsApp save) —
       // wait for things to settle before re-scanning enabled albums instead
       // of firing a sync per individual change event.
-      _debounce = Timer(const Duration(seconds: 3), syncAll);
+      _debounce = Timer(const Duration(seconds: 3), () {
+        // Bump regardless of whether anything gets auto-uploaded below — a
+        // new screenshot/photo in an album that ISN'T backup-enabled (or
+        // that's held back on mobile data) still needs Gallery and the album
+        // detail screen to notice it's there now. Those screens only re-scan
+        // the device on this signal; without it, a photo the OS added
+        // wouldn't show up until something else happened to bump it.
+        bumpDeviceState(_ref);
+        syncAll();
+      });
     };
     PhotoManager.addChangeCallback(_changeCallback!);
     unawaited(PhotoManager.startChangeNotify());

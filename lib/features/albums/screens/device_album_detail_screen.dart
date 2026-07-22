@@ -407,47 +407,60 @@ class _DeviceAlbumDetailScreenState
                         ),
                       )
                     : _assets.isEmpty
-                    ? const Center(
-                        child: Text('No photos or videos in this album.',
-                            style: TextStyle(color: Colors.white54)),
-                      )
-                    : GridView.builder(
-                        padding: const EdgeInsets.all(2),
-                        gridDelegate:
-                            const SliverGridDelegateWithMaxCrossAxisExtent(
-                          maxCrossAxisExtent: 120,
-                          crossAxisSpacing: 2,
-                          mainAxisSpacing: 2,
+                    ? RefreshIndicator(
+                        onRefresh: _refreshAssetsQuietly,
+                        child: ListView(
+                          children: const [
+                            Padding(
+                              padding: EdgeInsets.only(top: 120),
+                              child: Center(
+                                child: Text('No photos or videos in this album.',
+                                    style: TextStyle(color: Colors.white54)),
+                              ),
+                            ),
+                          ],
                         ),
-                        itemCount: _assets.length,
-                        itemBuilder: (context, i) {
-                          final asset = _assets[i];
-                          return _AssetTile(
-                            asset: asset,
-                            backed: isEnabled &&
-                                BackupRegistry.instance.isUploaded(asset.id),
-                            selected: _selected.contains(asset.id),
-                            onTap: () {
-                              if (_selecting) {
-                                _toggle(asset.id);
-                              } else {
-                                Navigator.of(context).push(
-                                  MaterialPageRoute(
-                                    builder: (_) => DeviceAssetViewerScreen(
-                                      assets: _assets,
-                                      initialIndex: i,
+                      )
+                    : RefreshIndicator(
+                        onRefresh: _refreshAssetsQuietly,
+                        child: GridView.builder(
+                          padding: const EdgeInsets.all(2),
+                          gridDelegate:
+                              const SliverGridDelegateWithMaxCrossAxisExtent(
+                            maxCrossAxisExtent: 120,
+                            crossAxisSpacing: 2,
+                            mainAxisSpacing: 2,
+                          ),
+                          itemCount: _assets.length,
+                          itemBuilder: (context, i) {
+                            final asset = _assets[i];
+                            return _AssetTile(
+                              asset: asset,
+                              backed: isEnabled &&
+                                  BackupRegistry.instance.isUploaded(asset.id),
+                              selected: _selected.contains(asset.id),
+                              onTap: () {
+                                if (_selecting) {
+                                  _toggle(asset.id);
+                                } else {
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute(
+                                      builder: (_) => DeviceAssetViewerScreen(
+                                        assets: _assets,
+                                        initialIndex: i,
+                                      ),
                                     ),
-                                  ),
-                                  // The viewer may have deleted this asset — refresh so
-                                  // the grid doesn't keep showing (and crash opening) it.
-                                ).then((_) => _refreshAssetsQuietly());
-                              }
-                            },
-                            onLongPress: () => _selecting
-                                ? _toggle(asset.id)
-                                : _startSelection(asset.id),
-                          );
-                        },
+                                    // The viewer may have deleted this asset — refresh so
+                                    // the grid doesn't keep showing (and crash opening) it.
+                                  ).then((_) => _refreshAssetsQuietly());
+                                }
+                              },
+                              onLongPress: () => _selecting
+                                  ? _toggle(asset.id)
+                                  : _startSelection(asset.id),
+                            );
+                          },
+                        ),
                       ),
           ),
         ],
