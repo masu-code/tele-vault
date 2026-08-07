@@ -109,6 +109,18 @@ class AuthNotifier extends StateNotifier<AuthState> {
     }
   }
 
+  /// Call when something has confirmed the saved session is genuinely dead
+  /// (not a transient transport blip) — e.g. AUTH_KEY_UNREGISTERED persisting
+  /// across many reconnect attempts on different requests, which reusing the
+  /// same key can never recover from; only a fresh login can. Clears the
+  /// saved session and drops back to the phone-number screen so the user
+  /// sees they need to log in again, instead of the app silently retrying a
+  /// dead key forever in the background.
+  Future<void> invalidateSession() async {
+    await TelegramService.instance.clearSession();
+    state = const AuthState(step: AuthStep.initial);
+  }
+
   String _friendlyError(Object e) {
     if (e is TimeoutException || e is SocketDeadException || e is SocketException) {
       return 'Connection problem. Please try again.';

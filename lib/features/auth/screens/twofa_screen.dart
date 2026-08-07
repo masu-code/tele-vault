@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../shell/main_shell.dart';
 import '../providers/auth_provider.dart';
 
 class TwoFaScreen extends ConsumerStatefulWidget {
@@ -22,6 +23,20 @@ class _TwoFaScreenState extends ConsumerState<TwoFaScreen> {
   @override
   Widget build(BuildContext context) {
     final auth = ref.watch(authProvider);
+
+    ref.listen(authProvider, (_, next) {
+      // Changing MaterialApp.home alone doesn't affect routes already
+      // pushed on top of it (Phone -> Otp -> TwoFa) — without this, a
+      // successful password check leaves the user stuck looking at this
+      // screen forever even though the app is actually logged in
+      // underneath. Replace the whole stack so MainShell is what's left.
+      if (next.step == AuthStep.authenticated) {
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(builder: (_) => const MainShell()),
+          (route) => false,
+        );
+      }
+    });
 
     return Scaffold(
       appBar: AppBar(title: const Text('Two-Step Verification')),

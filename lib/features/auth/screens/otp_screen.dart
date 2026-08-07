@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../shell/main_shell.dart';
 import '../providers/auth_provider.dart';
 import 'twofa_screen.dart';
 
@@ -27,6 +28,14 @@ class _OtpScreenState extends ConsumerState<OtpScreen> {
       if (next.step == AuthStep.waitingPassword) {
         Navigator.of(context).push(
           MaterialPageRoute(builder: (_) => const TwoFaScreen()),
+        );
+      } else if (next.step == AuthStep.authenticated) {
+        // No 2FA needed — signIn() alone reached authenticated. Same fix as
+        // TwoFaScreen: replace the whole pushed stack with MainShell instead
+        // of leaving this screen stuck on top forever.
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(builder: (_) => const MainShell()),
+          (route) => false,
         );
       }
     });

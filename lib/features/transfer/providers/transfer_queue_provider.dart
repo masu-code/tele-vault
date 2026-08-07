@@ -8,6 +8,7 @@ import '../../../core/backup/device_state_bus.dart';
 import '../../../core/local_storage/local_file_service.dart';
 import '../../../core/upload/upload_worker.dart';
 import '../../../models/file_item.dart';
+import '../../auth/providers/auth_provider.dart';
 import '../../explorer/providers/index_provider.dart';
 
 enum TransferKind { upload, download }
@@ -77,6 +78,18 @@ class TransferQueueNotifier extends StateNotifier<TransferState> {
   final List<FileItem> _downloads = [];
   bool _running = false;
 
+  /// Consecutive AUTH_KEY_UNREGISTERED failures across *different* items —
+  /// UploadWorker/DownloadService already retry-and-reconnect within a
+  /// single item before giving up, so if it's still failing by the time the
+  /// exception reaches here, reconnecting again for the next item won't
+  /// help either: it's the same dead key every time. Once several different
+  /// items in a row all hit this, the session is genuinely revoked (e.g. by
+  /// Telegram itself, or logged out from another device) rather than a
+  /// transient blip — only a fresh login can recover from that, so stop
+  /// hammering it and send the user back to the login screen.
+  int _consecutiveAuthKeyDead = 0;
+  static const _authKeyDeadThreshold = 5;
+
   /// Rebuilding the gallery feed re-merges/re-sorts every device asset
   /// against the cloud index — cheap once, but during a mass upload it was
   /// firing every [_flushEvery] files (a periodic hitch on top of whatever
@@ -86,6 +99,23 @@ class TransferQueueNotifier extends StateNotifier<TransferState> {
   /// is never stale.
   DateTime? _lastBump;
   static const _bumpInterval = Duration(seconds: 15);
+
+  /// Tracks [e] against [_consecutiveAuthKeyDead] and, once the threshold is
+  /// hit, invalidates the session and reports that the queue should stop.
+  bool _noteFailure(Object e) {
+    if (e.toString().contains('AUTH_KEY_UNREGISTERED')) {
+      _consecutiveAuthKeyDead++;
+      if (_consecutiveAuthKeyDead >= _authKeyDeadThreshold) {
+        debugPrint('TVQUEUE: session appears dead after $_consecutiveAuthKeyDead '
+            'consecutive AUTH_KEY_UNREGISTERED failures — logging out');
+        unawaited(_ref.read(authProvider.notifier).invalidateSession());
+        return true;
+      }
+    } else {
+      _consecutiveAuthKeyDead = 0;
+    }
+    return false;
+  }
 
   void _maybeBump({bool force = false}) {
     final now = DateTime.now();
@@ -178,9 +208,15 @@ class TransferQueueNotifier extends StateNotifier<TransferState> {
             }
           }
           state = state.copyWith(done: state.done + 1);
+          _consecutiveAuthKeyDead = 0;
         } catch (e) {
           debugPrint('TVQUEUE: upload failed ${asset.title}: $e');
           state = state.copyWith(done: state.done + 1, failed: state.failed + 1);
+          if (_noteFailure(e)) {
+            state = state.copyWith(canceling: true);
+            _uploads.clear();
+            _downloads.clear();
+          }
         }
         debugPrint('TVQUEUE: ${state.done}/${state.total} (up) ${asset.title}');
         if (pending.length >= _flushEvery) await flush();
@@ -205,9 +241,15 @@ class TransferQueueNotifier extends StateNotifier<TransferState> {
             );
           }
           state = state.copyWith(done: state.done + 1);
+          _consecutiveAuthKeyDead = 0;
         } catch (e) {
           debugPrint('TVQUEUE: download failed ${item.name}: $e');
           state = state.copyWith(done: state.done + 1, failed: state.failed + 1);
+          if (_noteFailure(e)) {
+            state = state.copyWith(canceling: true);
+            _uploads.clear();
+            _downloads.clear();
+          }
         }
         debugPrint('TVQUEUE: ${state.done}/${state.total} (down) ${item.name}');
         await Future.delayed(Duration.zero);
