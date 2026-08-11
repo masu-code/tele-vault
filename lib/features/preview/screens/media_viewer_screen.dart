@@ -64,9 +64,21 @@ class _MediaViewerScreenState extends State<MediaViewerScreen> {
             onPageChanged: (i) => setState(() => _current = i),
             itemBuilder: (context, i) {
               final media = widget.items[i];
+              void previous() => _go(-1);
+              void next() => _go(1);
               return media.mimeType.startsWith('video/')
-                  ? CloudVideoPage(key: ValueKey(media.id), file: media)
-                  : CloudImagePage(key: ValueKey(media.id), file: media);
+                  ? CloudVideoPage(
+                      key: ValueKey(media.id),
+                      file: media,
+                      onPrevious: previous,
+                      onNext: next,
+                    )
+                  : CloudImagePage(
+                      key: ValueKey(media.id),
+                      file: media,
+                      onPrevious: previous,
+                      onNext: next,
+                    );
             },
           ),
         ),

@@ -8,6 +8,7 @@ import '../explorer/providers/index_provider.dart';
 import '../explorer/screens/explorer_screen.dart';
 import '../gallery/screens/gallery_screen.dart';
 import '../profile/providers/profile_provider.dart';
+import 'scroll_to_top.dart';
 
 /// Top-level navigation: Gallery (default), Albums, and Files. The vault index
 /// is loaded once here and shared by all three tabs.
@@ -20,6 +21,16 @@ class MainShell extends ConsumerStatefulWidget {
 
 class _MainShellState extends ConsumerState<MainShell> {
   int _index = 0;
+  int _scrollTopSeq = 0;
+
+  /// Tapping a nav destination scrolls that tab's list back to the top —
+  /// including (especially) the tab already selected, which otherwise did
+  /// nothing at all and left you scrolling by hand from deep in the timeline.
+  void _onDestinationSelected(int i) {
+    setState(() => _index = i);
+    ref.read(scrollToTopProvider.notifier).state =
+        ScrollToTopSignal(i, ++_scrollTopSeq);
+  }
 
   /// Debug/verification hook: with --dart-define=TV_AUTO_UPLOAD=1 the app
   /// pushes every pending device photo/video into the transfer queue once
@@ -58,7 +69,7 @@ class _MainShellState extends ConsumerState<MainShell> {
       body: IndexedStack(index: _index, children: _tabs),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _index,
-        onDestinationSelected: (i) => setState(() => _index = i),
+        onDestinationSelected: _onDestinationSelected,
         destinations: const [
           NavigationDestination(
             icon: Icon(Icons.photo_library_outlined),

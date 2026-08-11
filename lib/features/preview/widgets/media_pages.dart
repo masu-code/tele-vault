@@ -40,13 +40,35 @@ class DragScrollBehavior extends MaterialScrollBehavior {
       };
 }
 
+/// How far a double tap on a video's left/right edge jumps.
+const _seekStep = Duration(seconds: 10);
+
+/// Seeks [player] by [delta], clamped to the clip's bounds. Shared by both
+/// video pages' double-tap handlers.
+void _seekBy(Player player, Duration delta) {
+  final target = player.state.position + delta;
+  final duration = player.state.duration;
+  player.seek(
+    target < Duration.zero
+        ? Duration.zero
+        : (duration > Duration.zero && target > duration ? duration : target),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Cloud pages — a FileItem stored in the Telegram-backed vault.
 // ---------------------------------------------------------------------------
 
 class CloudImagePage extends ConsumerStatefulWidget {
-  const CloudImagePage({super.key, required this.file});
+  const CloudImagePage({
+    super.key,
+    required this.file,
+    this.onPrevious,
+    this.onNext,
+  });
   final FileItem file;
+  final VoidCallback? onPrevious;
+  final VoidCallback? onNext;
 
   @override
   ConsumerState<CloudImagePage> createState() => _CloudImagePageState();
@@ -105,6 +127,8 @@ class _CloudImagePageState extends ConsumerState<CloudImagePage> {
       actions: cloudMediaActions(context, ref, widget.file),
       infoBuilder: (context) => cloudMediaInfo(widget.file),
       gestureDisabled: _zoomed,
+      onPrevious: widget.onPrevious,
+      onNext: widget.onNext,
       child: InteractiveViewer(
         transformationController: _transform,
         minScale: 0.5,
@@ -122,8 +146,15 @@ class _CloudImagePageState extends ConsumerState<CloudImagePage> {
 }
 
 class CloudVideoPage extends ConsumerStatefulWidget {
-  const CloudVideoPage({super.key, required this.file});
+  const CloudVideoPage({
+    super.key,
+    required this.file,
+    this.onPrevious,
+    this.onNext,
+  });
   final FileItem file;
+  final VoidCallback? onPrevious;
+  final VoidCallback? onNext;
 
   @override
   ConsumerState<CloudVideoPage> createState() => _CloudVideoPageState();
@@ -187,6 +218,10 @@ class _CloudVideoPageState extends ConsumerState<CloudVideoPage> {
       actions: cloudMediaActions(context, ref, widget.file),
       infoBuilder: (context) => cloudMediaInfo(widget.file),
       gestureDisabled: _zoomed,
+      onPrevious: widget.onPrevious,
+      onNext: widget.onNext,
+      onSeekBackward: () => _seekBy(_player, -_seekStep),
+      onSeekForward: () => _seekBy(_player, _seekStep),
       child: InteractiveViewer(
         transformationController: _transform,
         // Panning stays off for video: a single-finger drag needs to reach
@@ -333,8 +368,15 @@ Widget cloudMediaInfo(FileItem file) {
 // ---------------------------------------------------------------------------
 
 class LocalImagePage extends ConsumerStatefulWidget {
-  const LocalImagePage({super.key, required this.asset});
+  const LocalImagePage({
+    super.key,
+    required this.asset,
+    this.onPrevious,
+    this.onNext,
+  });
   final AssetEntity asset;
+  final VoidCallback? onPrevious;
+  final VoidCallback? onNext;
 
   @override
   ConsumerState<LocalImagePage> createState() => _LocalImagePageState();
@@ -389,6 +431,8 @@ class _LocalImagePageState extends ConsumerState<LocalImagePage> {
       actions: localMediaActions(context, ref, widget.asset, local),
       infoBuilder: (context) => localMediaInfo(widget.asset, local),
       gestureDisabled: _zoomed,
+      onPrevious: widget.onPrevious,
+      onNext: widget.onNext,
       child: InteractiveViewer(
         transformationController: _transform,
         minScale: 0.5,
@@ -406,8 +450,15 @@ class _LocalImagePageState extends ConsumerState<LocalImagePage> {
 }
 
 class LocalVideoPage extends ConsumerStatefulWidget {
-  const LocalVideoPage({super.key, required this.asset});
+  const LocalVideoPage({
+    super.key,
+    required this.asset,
+    this.onPrevious,
+    this.onNext,
+  });
   final AssetEntity asset;
+  final VoidCallback? onPrevious;
+  final VoidCallback? onNext;
 
   @override
   ConsumerState<LocalVideoPage> createState() => _LocalVideoPageState();
@@ -466,6 +517,10 @@ class _LocalVideoPageState extends ConsumerState<LocalVideoPage> {
       actions: localMediaActions(context, ref, widget.asset, local),
       infoBuilder: (context) => localMediaInfo(widget.asset, local),
       gestureDisabled: _zoomed,
+      onPrevious: widget.onPrevious,
+      onNext: widget.onNext,
+      onSeekBackward: () => _seekBy(_player, -_seekStep),
+      onSeekForward: () => _seekBy(_player, _seekStep),
       child: InteractiveViewer(
         transformationController: _transform,
         // Panning stays off for video: a single-finger drag needs to reach

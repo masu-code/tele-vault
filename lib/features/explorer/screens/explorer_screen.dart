@@ -13,6 +13,7 @@ import '../../upload/providers/upload_provider.dart';
 import '../../../models/file_index.dart';
 import '../../../models/file_item.dart';
 import '../../../models/folder.dart';
+import '../../shell/scroll_to_top.dart';
 import '../providers/index_provider.dart';
 import '../widgets/file_thumbnail.dart';
 import '../widgets/save_to_device_button.dart';
@@ -40,6 +41,23 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
   final Set<String> _selFiles = {};
   final Set<String> _selFolders = {};
   bool _selecting = false;
+
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _scrollToTop() {
+    if (!_scrollController.hasClients) return;
+    _scrollController.animateTo(
+      0,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOutCubic,
+    );
+  }
 
   String? get _currentFolderId => _path.isEmpty ? null : _path.last.id;
   int get _selCount => _selFiles.length + _selFolders.length;
@@ -224,6 +242,9 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    ref.listen(scrollToTopProvider, (prev, next) {
+      if (next != null && next.tabIndex == 2) _scrollToTop();
+    });
     final state = ref.watch(indexProvider);
     final upload = ref.watch(uploadProvider);
     final index = state.index;
@@ -416,6 +437,7 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
       );
     }
     return ListView(
+      controller: _scrollController,
       children: [
         for (final folder in folders)
           ListTile(

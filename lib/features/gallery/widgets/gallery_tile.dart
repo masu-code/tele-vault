@@ -1,15 +1,15 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import '../../../core/thumbnail/thumbnail_service.dart';
 import '../models/gallery_entry.dart';
 
-/// A square gallery cell. Its thumbnail is requested in [initState] and
-/// cancelled in [dispose] — the surrounding `SliverGrid` already builds and
-/// destroys tiles lazily based on the viewport (plus `cacheExtent`), so that
-/// lifecycle alone is enough to load only what's near-screen; no separate
-/// visibility-polling package is needed on top of it. Supports a selected
-/// state for multi-select.
+/// A square gallery cell. Its thumbnail is requested shortly after the tile
+/// is built and cancelled in [dispose] — the surrounding `SliverGrid` already
+/// builds and destroys tiles lazily based on the viewport (plus
+/// `scrollCacheExtent`), so that lifecycle alone decides what loads.
+/// Supports a selected state for multi-select.
 ///
 /// Renders either a cloud [GalleryEntry.fileItem] (preferred when both are
 /// present — cache/pool-managed by [ThumbnailService], independent of whether
@@ -37,6 +37,16 @@ class _GalleryTileState extends State<GalleryTile> {
   File? _cloudThumb;
   Uint8List? _localThumb;
   bool _done = false;
+  Timer? _startTimer;
+
+  /// How long a tile has to survive before its thumbnail is actually
+  /// requested. A fast fling builds and destroys rows faster than this, so
+  /// those tiles come and go without ever enqueueing work — only whatever is
+  /// still alive once the scroll settles asks for anything. This is what
+  /// keeps a flick from burying the queue under requests for rows that are
+  /// already gone. Anything already in memory skips the wait entirely (see
+  /// [_request]), so scrolling back over loaded content stays instant.
+  static const _requestDelay = Duration(milliseconds: 120);
 
   @override
   void initState() {
@@ -48,13 +58,12 @@ class _GalleryTileState extends State<GalleryTile> {
   void didUpdateWidget(GalleryTile oldWidget) {
     super.didUpdateWidget(oldWidget);
     // If this cell is recycled for a different entry, reload its thumbnail.
+    // No setState needed — a rebuild always follows didUpdateWidget.
     if (oldWidget.entry.key != widget.entry.key) {
       _cancel(oldWidget.entry);
-      setState(() {
-        _cloudThumb = null;
-        _localThumb = null;
-        _done = false;
-      });
+      _cloudThumb = null;
+      _localThumb = null;
+      _done = false;
       _request();
     }
   }
@@ -65,27 +74,52 @@ class _GalleryTileState extends State<GalleryTile> {
     super.dispose();
   }
 
+  /// The id [_request] would fetch this entry under — cloud when available,
+  /// device asset otherwise. [cancel] has to use the identical key.
+  String _requestId(GalleryEntry entry) =>
+      entry.fileItem?.id ?? entry.asset!.id;
+
   void _cancel(GalleryEntry entry) {
-    // Cancellation only applies to the cloud path — ThumbnailService's
-    // pool/cancel machinery exists for Telegram network fetches. Local
-    // thumbnails are cheap/cached, so an in-flight one is left to finish and
-    // populate the cache for next time rather than aborted.
-    if (!_done && entry.fileItem != null) {
-      ThumbnailService.instance.cancel(entry.fileItem!.id);
-    }
+    _startTimer?.cancel();
+    if (_done) return;
+    ThumbnailService.instance.cancel(_requestId(entry));
   }
 
   void _request() {
-    final fileItem = widget.entry.fileItem;
+    final service = ThumbnailService.instance;
+    final entry = widget.entry;
+    final fileItem = entry.fileItem;
+
+    // Already decoded and in memory — paint it now rather than paying the
+    // debounce (and a pool round-trip) for something we already have.
     if (fileItem != null) {
-      ThumbnailService.instance.thumbnailFor(fileItem).then((f) {
-        if (mounted) setState(() { _cloudThumb = f; _done = true; });
-      });
+      final hit = service.cachedCloud(fileItem.id);
+      if (hit != null) {
+        _cloudThumb = hit;
+        _done = true;
+        return;
+      }
     } else {
-      ThumbnailService.instance.localThumbnailFor(widget.entry.asset!).then((data) {
-        if (mounted) setState(() { _localThumb = data; _done = true; });
-      });
+      final hit = service.cachedLocal(entry.asset!.id);
+      if (hit != null) {
+        _localThumb = hit;
+        _done = true;
+        return;
+      }
     }
+
+    _startTimer = Timer(_requestDelay, () {
+      if (!mounted) return;
+      if (fileItem != null) {
+        service.thumbnailFor(fileItem).then((f) {
+          if (mounted) setState(() { _cloudThumb = f; _done = true; });
+        });
+      } else {
+        service.localThumbnailFor(entry.asset!).then((data) {
+          if (mounted) setState(() { _localThumb = data; _done = true; });
+        });
+      }
+    });
   }
 
   @override
@@ -115,16 +149,15 @@ class _GalleryTileState extends State<GalleryTile> {
                   cacheWidth: 300,
                   errorBuilder: (_, _, _) => _placeholder(entry.isVideo),
                 )
-              else if (!_done)
-                const Center(
-                  child: SizedBox(
-                    width: 20, height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                )
               else
-                _placeholder(entry.isVideo),
-              if (entry.isVideo && !widget.selected)
+                // Deliberately a flat box while loading, not a spinner: a
+                // screenful of CircularProgressIndicators animates every
+                // frame, so the placeholder itself was competing for the
+                // frame budget during exactly the scroll it was meant to
+                // cover. Matches how Telegram/Google Photos show an empty
+                // cell until the image is ready.
+                const SizedBox.shrink(),
+              if (entry.isVideo && (_cloudThumb != null || _localThumb != null) && !widget.selected)
                 const Align(
                   child: Icon(Icons.play_circle_fill, color: Colors.white70, size: 32),
                 ),

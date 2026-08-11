@@ -50,14 +50,34 @@ class ThumbnailService {
   // 4 download slots above — a faster local resource gets its own budget.
   static const int _maxConcurrentLocal = 6;
   final Pool _localPool = Pool(_maxConcurrentLocal);
-  final Map<String, Uint8List?> _localMem = {};
+  final Map<String, Uint8List> _localMem = {};
   final Map<String, Future<Uint8List?>> _localInflight = {};
+
+  /// Cap on decoded device thumbnails held in memory. Without a bound this
+  /// grew one entry per asset ever scrolled past — thousands of buffers on a
+  /// large library. Evicts oldest-first (plain insertion order).
+  static const int _localMemCap = 400;
 
   Directory? _dir;
 
-  /// Marks a thumbnail job as cancellable; a not-yet-started job will be
-  /// skipped. Called when a tile leaves the viewport.
-  void cancel(String fileId) => _cancelled.add(fileId);
+  /// Marks a request as cancelled so it can be skipped. Keyed by the same id
+  /// the request was made with (a cloud file id or a device asset id).
+  /// Called when a tile leaves the viewport.
+  void cancel(String id) => _cancelled.add(id);
+
+  /// The already-in-memory thumbnail for [fileId]/[assetId], or null. Lets a
+  /// tile paint instantly when scrolling back over content it already loaded,
+  /// instead of going through the request path again for something in hand.
+  File? cachedCloud(String fileId) => _mem[fileId];
+  Uint8List? cachedLocal(String assetId) => _localMem[assetId];
+
+  void _rememberLocal(String id, Uint8List bytes) {
+    _localMem.remove(id); // re-insert so it counts as most-recently used
+    _localMem[id] = bytes;
+    while (_localMem.length > _localMemCap) {
+      _localMem.remove(_localMem.keys.first);
+    }
+  }
 
   Future<Directory> _thumbDir() async {
     if (_dir != null) return _dir!;
@@ -83,7 +103,11 @@ class ThumbnailService {
       try {
         if (_cancelled.contains(file.id)) return null;
         final result = await _pool.withResource(() => _generate(file, onDisk));
-        _mem[file.id] = result;
+        // A null from a cancelled job means "didn't run", not "has no
+        // thumbnail" — caching that would leave the tile blank for good.
+        // A null from a job that did run (e.g. a video with no server
+        // thumbnail) is worth caching so it isn't retried every time.
+        if (!_cancelled.contains(file.id)) _mem[file.id] = result;
         return result;
       } catch (_) {
         return null;
@@ -121,14 +145,26 @@ class ThumbnailService {
   /// view called photo_manager directly with no cache and no concurrency
   /// limit at all.
   Future<Uint8List?> localThumbnailFor(AssetEntity asset) async {
-    if (_localMem.containsKey(asset.id)) return _localMem[asset.id];
+    _cancelled.remove(asset.id); // requesting again clears any prior cancel
+    final cached = _localMem[asset.id];
+    if (cached != null) return cached;
 
     return _localInflight.putIfAbsent(asset.id, () async {
       try {
-        final bytes = await _localPool.withResource(
-          () => asset.thumbnailDataWithSize(const ThumbnailSize(200, 200)),
-        );
-        _localMem[asset.id] = bytes;
+        final bytes = await _localPool.withResource(() {
+          // Checked HERE — inside the pool callback — and not just before
+          // queueing. withResource() runs this only once a slot frees up,
+          // which during a fast fling is long after the tile that asked for
+          // it was destroyed. Without this check those dead requests still
+          // ran, so the 6 slots stayed full of work for rows the user had
+          // already scrolled past and nothing on screen could load until the
+          // whole backlog drained — i.e. until scrolling fully stopped.
+          if (_cancelled.contains(asset.id)) return null;
+          return asset.thumbnailDataWithSize(const ThumbnailSize(200, 200));
+        });
+        // Deliberately not caching a null: it means "cancelled" or "failed",
+        // and caching it would make the tile permanently blank on scroll-back.
+        if (bytes != null) _rememberLocal(asset.id, bytes);
         return bytes;
       } catch (_) {
         return null;

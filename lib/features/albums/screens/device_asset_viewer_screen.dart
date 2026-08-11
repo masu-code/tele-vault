@@ -28,6 +28,17 @@ class _DeviceAssetViewerScreenState extends State<DeviceAssetViewerScreen> {
     super.dispose();
   }
 
+  void _go(int delta) {
+    final page = _controller.page?.round() ?? widget.initialIndex;
+    final target = (page + delta).clamp(0, widget.assets.length - 1);
+    if (target == page) return;
+    _controller.animateToPage(
+      target,
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOut,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -39,9 +50,21 @@ class _DeviceAssetViewerScreenState extends State<DeviceAssetViewerScreen> {
           itemCount: widget.assets.length,
           itemBuilder: (context, i) {
             final a = widget.assets[i];
+            void previous() => _go(-1);
+            void next() => _go(1);
             return a.type == AssetType.video
-                ? LocalVideoPage(key: ValueKey(a.id), asset: a)
-                : LocalImagePage(key: ValueKey(a.id), asset: a);
+                ? LocalVideoPage(
+                    key: ValueKey(a.id),
+                    asset: a,
+                    onPrevious: previous,
+                    onNext: next,
+                  )
+                : LocalImagePage(
+                    key: ValueKey(a.id),
+                    asset: a,
+                    onPrevious: previous,
+                    onNext: next,
+                  );
           },
         ),
       ),

@@ -63,14 +63,36 @@ class _MixedMediaViewerScreenState extends State<MixedMediaViewerScreen> {
             onPageChanged: (i) => setState(() => _current = i),
             itemBuilder: (context, i) {
               final entry = widget.entries[i];
+              void previous() => _go(-1);
+              void next() => _go(1);
               if (entry.fileItem != null) {
                 return entry.isVideo
-                    ? CloudVideoPage(key: ValueKey(entry.key), file: entry.fileItem!)
-                    : CloudImagePage(key: ValueKey(entry.key), file: entry.fileItem!);
+                    ? CloudVideoPage(
+                        key: ValueKey(entry.key),
+                        file: entry.fileItem!,
+                        onPrevious: previous,
+                        onNext: next,
+                      )
+                    : CloudImagePage(
+                        key: ValueKey(entry.key),
+                        file: entry.fileItem!,
+                        onPrevious: previous,
+                        onNext: next,
+                      );
               }
               return entry.isVideo
-                  ? LocalVideoPage(key: ValueKey(entry.key), asset: entry.asset!)
-                  : LocalImagePage(key: ValueKey(entry.key), asset: entry.asset!);
+                  ? LocalVideoPage(
+                      key: ValueKey(entry.key),
+                      asset: entry.asset!,
+                      onPrevious: previous,
+                      onNext: next,
+                    )
+                  : LocalImagePage(
+                      key: ValueKey(entry.key),
+                      asset: entry.asset!,
+                      onPrevious: previous,
+                      onNext: next,
+                    );
             },
           ),
         ),

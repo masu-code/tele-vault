@@ -13,10 +13,12 @@ import '../../preview/screens/mixed_media_viewer_screen.dart';
 import '../../preview/widgets/add_to_album_sheet.dart';
 import '../../preview/widgets/delete_source_dialog.dart';
 import '../../profile/widgets/floating_profile_header.dart';
+import '../../shell/scroll_to_top.dart';
 import '../../transfer/providers/transfer_queue_provider.dart';
 import '../models/gallery_entry.dart';
 import '../providers/gallery_feed_provider.dart';
 import '../services/gallery_feed_service.dart';
+import '../widgets/fast_scrollbar.dart';
 import '../widgets/gallery_tile.dart';
 
 /// Google Photos-style timeline of ALL media, grouped by month — both
@@ -58,6 +60,15 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
   void dispose() {
     _scrollController.dispose();
     super.dispose();
+  }
+
+  void _scrollToTop() {
+    if (!_scrollController.hasClients) return;
+    _scrollController.animateTo(
+      0,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOutCubic,
+    );
   }
 
   Future<void> _grantDeviceAccess() async {
@@ -197,6 +208,9 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
     final groupsAsync = ref.watch(galleryMonthGroupsProvider);
     final flat = feedAsync.valueOrNull ?? const <GalleryEntry>[];
 
+    ref.listen(scrollToTopProvider, (prev, next) {
+      if (next != null && next.tabIndex == 0) _scrollToTop();
+    });
     ref.listen(downloadProvider, (prev, next) {
       final msg = next.savedMessage ?? (next.error != null ? 'Failed: ${next.error}' : null);
       if (msg != null && (next.savedMessage != prev?.savedMessage || next.error != prev?.error)) {
@@ -339,10 +353,19 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
           index += group.entries.length;
         }
 
-        return Scrollbar(
+        return FastScrollbar(
           controller: _scrollController,
-          thumbVisibility: true,
-          interactive: true,
+          topInset: topInset,
+          bottomInset: 12,
+          // An estimate: it maps scroll fraction straight onto the flat entry
+          // list, which ignores the extra height month headers add. Good
+          // enough to aim at a month while scrubbing, and far cheaper than
+          // measuring real sliver geometry on every drag frame.
+          labelForFraction: (f) {
+            if (flat.isEmpty) return null;
+            final i = (f * (flat.length - 1)).round().clamp(0, flat.length - 1);
+            return monthLabel(flat[i].effectiveDate.toLocal());
+          },
           child: RefreshIndicator(
             onRefresh: () async {
               GalleryFeedService.instance.invalidateCache();

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
@@ -23,11 +24,14 @@ class ViewerAction {
 }
 
 /// Shared chrome for the full-screen media viewers (cloud and local):
-/// - Tap toggles floating semi-transparent buttons over the media (back top
-///   left, an action row at the bottom) — no new window, just show/hide.
+/// - Tap zones: the outer quarter on each side steps to the previous/next
+///   item, the middle toggles the floating controls.
+/// - Optional double-tap on the outer quarters (video only) seeks.
 /// - Swipe up smoothly grows an info panel from the bottom while the media
 ///   shrinks to make room, tracking the finger 1:1 and settling with a short
 ///   animation on release — not a modal, part of the same screen.
+/// - Top and bottom gradient scrims keep the controls legible over any
+///   content, including a photo that's white edge to edge.
 class ViewerPageChrome extends StatefulWidget {
   const ViewerPageChrome({
     super.key,
@@ -36,6 +40,10 @@ class ViewerPageChrome extends StatefulWidget {
     required this.infoBuilder,
     this.onBack,
     this.gestureDisabled,
+    this.onPrevious,
+    this.onNext,
+    this.onSeekBackward,
+    this.onSeekForward,
   });
 
   /// The full-bleed media content (image or video).
@@ -59,6 +67,18 @@ class ViewerPageChrome extends StatefulWidget {
   /// should always pan the image, never fight it for the info panel.
   final ValueListenable<bool>? gestureDisabled;
 
+  /// Single tap on the left/right quarter of the screen. Null disables that
+  /// zone, and taps there fall through to the middle's toggle behaviour.
+  final VoidCallback? onPrevious;
+  final VoidCallback? onNext;
+
+  /// Double tap on the left/right quarter. Supplying either enables
+  /// double-tap detection, which necessarily delays single taps slightly
+  /// while the recognizer waits for a possible second tap — so only video
+  /// pages pass these, leaving photo paging instant.
+  final VoidCallback? onSeekBackward;
+  final VoidCallback? onSeekForward;
+
   @override
   State<ViewerPageChrome> createState() => _ViewerPageChromeState();
 }
@@ -66,6 +86,10 @@ class ViewerPageChrome extends StatefulWidget {
 class _ViewerPageChromeState extends State<ViewerPageChrome>
     with SingleTickerProviderStateMixin {
   static const _maxPanelExtent = 320.0;
+
+  /// Fraction of the width on each edge that acts as a prev/next (and seek)
+  /// zone. The middle half stays free for toggling the chrome.
+  static const _edgeZone = 0.25;
 
   bool _chromeVisible = true;
   double _panelExtent = 0;
@@ -82,6 +106,15 @@ class _ViewerPageChromeState extends State<ViewerPageChrome>
   /// get eaten as a vertical drag before zooming ever had a chance to begin.
   int _activePointers = 0;
 
+  /// Where the in-progress double tap landed. [GestureDetector.onDoubleTap]
+  /// carries no position, so it has to be captured on the preceding down.
+  Offset? _doubleTapPos;
+
+  /// Brief "10s" bubble shown after a seek, and which side to show it on.
+  String? _seekHint;
+  bool _seekHintOnLeft = false;
+  Timer? _seekHintTimer;
+
   @override
   void initState() {
     super.initState();
@@ -93,6 +126,7 @@ class _ViewerPageChromeState extends State<ViewerPageChrome>
 
   @override
   void dispose() {
+    _seekHintTimer?.cancel();
     _snapController.dispose();
     super.dispose();
   }
@@ -117,12 +151,55 @@ class _ViewerPageChromeState extends State<ViewerPageChrome>
     _snapTo(open ? _maxPanelExtent : 0, velocity: velocity);
   }
 
-  void _onTap() {
+  /// Which edge zone [dx] falls in, given the content width: -1 left, 1
+  /// right, 0 middle.
+  int _zoneFor(double dx, double width) {
+    if (width <= 0) return 0;
+    if (dx < width * _edgeZone) return -1;
+    if (dx > width * (1 - _edgeZone)) return 1;
+    return 0;
+  }
+
+  void _onTapUp(TapUpDetails details, double width) {
+    // An open info panel swallows the tap to close, wherever it landed —
+    // paging out from under a half-open panel would leave it stranded over
+    // the next item's content.
     if (_panelExtent > 0) {
       _snapTo(0);
-    } else {
-      setState(() => _chromeVisible = !_chromeVisible);
+      return;
     }
+    switch (_zoneFor(details.localPosition.dx, width)) {
+      case -1 when widget.onPrevious != null:
+        widget.onPrevious!();
+      case 1 when widget.onNext != null:
+        widget.onNext!();
+      default:
+        setState(() => _chromeVisible = !_chromeVisible);
+    }
+  }
+
+  void _onDoubleTap(double width) {
+    final pos = _doubleTapPos;
+    if (pos == null) return;
+    switch (_zoneFor(pos.dx, width)) {
+      case -1 when widget.onSeekBackward != null:
+        widget.onSeekBackward!();
+        _showSeekHint('10s', onLeft: true);
+      case 1 when widget.onSeekForward != null:
+        widget.onSeekForward!();
+        _showSeekHint('10s', onLeft: false);
+    }
+  }
+
+  void _showSeekHint(String text, {required bool onLeft}) {
+    _seekHintTimer?.cancel();
+    setState(() {
+      _seekHint = text;
+      _seekHintOnLeft = onLeft;
+    });
+    _seekHintTimer = Timer(const Duration(milliseconds: 700), () {
+      if (mounted) setState(() => _seekHint = null);
+    });
   }
 
   @override
@@ -130,6 +207,8 @@ class _ViewerPageChromeState extends State<ViewerPageChrome>
     final panelOpenFraction = (_panelExtent / _maxPanelExtent).clamp(0.0, 1.0);
     final safeTop = MediaQuery.of(context).padding.top;
     final safeBottom = MediaQuery.of(context).padding.bottom;
+    final wantsDoubleTap =
+        widget.onSeekBackward != null || widget.onSeekForward != null;
 
     return Stack(
       children: [
@@ -140,18 +219,29 @@ class _ViewerPageChromeState extends State<ViewerPageChrome>
                 valueListenable: widget.gestureDisabled ?? _neverDisabled,
                 builder: (context, disabledByZoom, child) {
                   final disabled = disabledByZoom || _activePointers >= 2;
-                  return Listener(
-                    onPointerDown: (_) => setState(() => _activePointers++),
-                    onPointerUp: (_) =>
-                        setState(() => _activePointers = (_activePointers - 1).clamp(0, 10)),
-                    onPointerCancel: (_) =>
-                        setState(() => _activePointers = (_activePointers - 1).clamp(0, 10)),
-                    child: GestureDetector(
-                      onTap: disabled ? null : _onTap,
-                      onVerticalDragUpdate: disabled ? null : _onVerticalDragUpdate,
-                      onVerticalDragEnd: disabled ? null : _onVerticalDragEnd,
-                      child: child,
-                    ),
+                  return LayoutBuilder(
+                    builder: (context, constraints) {
+                      final width = constraints.maxWidth;
+                      return Listener(
+                        onPointerDown: (_) => setState(() => _activePointers++),
+                        onPointerUp: (_) => setState(
+                            () => _activePointers = (_activePointers - 1).clamp(0, 10)),
+                        onPointerCancel: (_) => setState(
+                            () => _activePointers = (_activePointers - 1).clamp(0, 10)),
+                        child: GestureDetector(
+                          onTapUp: disabled ? null : (d) => _onTapUp(d, width),
+                          onDoubleTapDown: disabled || !wantsDoubleTap
+                              ? null
+                              : (d) => _doubleTapPos = d.localPosition,
+                          onDoubleTap: disabled || !wantsDoubleTap
+                              ? null
+                              : () => _onDoubleTap(width),
+                          onVerticalDragUpdate: disabled ? null : _onVerticalDragUpdate,
+                          onVerticalDragEnd: disabled ? null : _onVerticalDragEnd,
+                          child: child,
+                        ),
+                      );
+                    },
                   );
                 },
                 child: widget.child,
@@ -193,31 +283,87 @@ class _ViewerPageChromeState extends State<ViewerPageChrome>
               ),
           ],
         ),
+
+        if (_seekHint != null)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: Align(
+                alignment: _seekHintOnLeft ? Alignment.centerLeft : Alignment.centerRight,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 40),
+                  child: _SeekHint(
+                    text: _seekHint!,
+                    forward: !_seekHintOnLeft,
+                  ),
+                ),
+              ),
+            ),
+          ),
+
+        // Top scrim + back button. The scrim is what makes a white icon
+        // readable over a white photo — see the bottom bar for the same idea.
         Positioned(
-          top: safeTop + 8,
-          left: 8,
-          child: AnimatedOpacity(
-            opacity: _panelExtent == 0 ? 1 : 0,
-            duration: const Duration(milliseconds: 150),
-            child: _FloatingCircleButton(
-              icon: Icons.arrow_back,
-              onTap: widget.onBack ?? () => Navigator.of(context).pop(),
+          top: 0,
+          left: 0,
+          right: 0,
+          child: IgnorePointer(
+            ignoring: !_chromeVisible || _panelExtent > 0,
+            child: AnimatedOpacity(
+              opacity: (_chromeVisible && _panelExtent == 0) ? 1 : 0,
+              duration: const Duration(milliseconds: 150),
+              child: Container(
+                padding: EdgeInsets.only(top: safeTop + 8, bottom: 24, left: 8, right: 8),
+                decoration: const BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [Color(0xB3000000), Color(0x00000000)],
+                  ),
+                ),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: IconButton(
+                    icon: const Icon(Icons.arrow_back, color: Colors.white),
+                    onPressed: widget.onBack ?? () => Navigator.of(context).pop(),
+                  ),
+                ),
+              ),
             ),
           ),
         ),
+
         if (widget.actions.isNotEmpty)
           Positioned(
             left: 0,
             right: 0,
-            bottom: 16 + safeBottom,
+            bottom: 0,
             child: IgnorePointer(
               ignoring: !_chromeVisible || _panelExtent > 0,
               child: AnimatedOpacity(
                 opacity: (_chromeVisible && _panelExtent == 0) ? 1 : 0,
                 duration: const Duration(milliseconds: 150),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                  children: [for (final a in widget.actions) _FloatingAction(action: a)],
+                child: Container(
+                  padding: EdgeInsets.only(top: 32, bottom: safeBottom + 12),
+                  // A single scrim behind the whole row, rather than a puck
+                  // per icon: individual circles still left the labels
+                  // unreadable, and over a bright photo the row as a whole
+                  // disappeared into the background.
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.bottomCenter,
+                      end: Alignment.topCenter,
+                      colors: [
+                        Color(0xD9000000),
+                        Color(0x99000000),
+                        Color(0x00000000),
+                      ],
+                      stops: [0.0, 0.55, 1.0],
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [for (final a in widget.actions) _FloatingAction(action: a)],
+                  ),
                 ),
               ),
             ),
@@ -227,19 +373,33 @@ class _ViewerPageChromeState extends State<ViewerPageChrome>
   }
 }
 
-class _FloatingCircleButton extends StatelessWidget {
-  const _FloatingCircleButton({required this.icon, required this.onTap});
-  final IconData icon;
-  final VoidCallback onTap;
+class _SeekHint extends StatelessWidget {
+  const _SeekHint({required this.text, required this.forward});
+  final String text;
+  final bool forward;
 
   @override
   Widget build(BuildContext context) {
-    return Material(
-      color: Colors.black45,
-      shape: const CircleBorder(),
-      child: IconButton(
-        icon: Icon(icon, color: Colors.white),
-        onPressed: onTap,
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+      decoration: const BoxDecoration(
+        color: Color(0x99000000),
+        shape: BoxShape.circle,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            forward ? Icons.fast_forward : Icons.fast_rewind,
+            color: Colors.white,
+            size: 26,
+          ),
+          const SizedBox(height: 2),
+          Text(
+            text,
+            style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+        ],
       ),
     );
   }
@@ -254,19 +414,18 @@ class _FloatingAction extends StatelessWidget {
     final color = action.onTap == null ? Colors.white38 : (action.color ?? Colors.white);
     return InkWell(
       onTap: action.onTap,
-      borderRadius: BorderRadius.circular(28),
+      borderRadius: BorderRadius.circular(12),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: const BoxDecoration(color: Colors.black45, shape: BoxShape.circle),
-              child: Icon(action.icon, color: color, size: 22),
+            Icon(action.icon, color: color, size: 24),
+            const SizedBox(height: 6),
+            Text(
+              action.label,
+              style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w500),
             ),
-            const SizedBox(height: 4),
-            Text(action.label, style: TextStyle(color: color, fontSize: 11)),
           ],
         ),
       ),

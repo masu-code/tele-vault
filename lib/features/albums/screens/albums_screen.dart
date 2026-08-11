@@ -9,6 +9,7 @@ import '../../../models/file_item.dart';
 import '../../backup/providers/backup_provider.dart';
 import '../../explorer/providers/index_provider.dart';
 import '../../profile/widgets/floating_profile_header.dart';
+import '../../shell/scroll_to_top.dart';
 import 'album_detail_screen.dart';
 import 'device_album_detail_screen.dart';
 
@@ -23,12 +24,29 @@ class AlbumsScreen extends ConsumerStatefulWidget {
 }
 
 class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
+  final ScrollController _scrollController = ScrollController();
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(backupProvider.notifier).loadDeviceAlbums();
     });
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _scrollToTop() {
+    if (!_scrollController.hasClients) return;
+    _scrollController.animateTo(
+      0,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOutCubic,
+    );
   }
 
   // --- Vault album actions -----------------------------------------------
@@ -146,6 +164,9 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    ref.listen(scrollToTopProvider, (prev, next) {
+      if (next != null && next.tabIndex == 1) _scrollToTop();
+    });
     final indexState = ref.watch(indexProvider);
     final backup = ref.watch(backupProvider);
     final vaultAlbums = indexState.index.albums;
@@ -174,6 +195,7 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
                   ),
                 )
               : GridView.builder(
+                  controller: _scrollController,
                   padding: EdgeInsets.fromLTRB(12, topInset, 12, 12),
                   gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
                     maxCrossAxisExtent: 200,
