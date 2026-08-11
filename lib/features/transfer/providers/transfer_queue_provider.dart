@@ -190,6 +190,10 @@ class TransferQueueNotifier extends StateNotifier<TransferState> {
 
       // --- Uploads ---
       while (_uploads.isNotEmpty && !state.canceling) {
+        // Tells the headless periodic background task (see
+        // headless_sync.dart) this process already has an upload connection
+        // open, so it skips its own run instead of opening a second one.
+        unawaited(registry.markQueueHeartbeat());
         final asset = _uploads.removeAt(0);
         state = state.copyWith(
           kind: TransferKind.upload,
@@ -227,6 +231,7 @@ class TransferQueueNotifier extends StateNotifier<TransferState> {
 
       // --- Downloads ---
       while (_downloads.isNotEmpty && !state.canceling) {
+        unawaited(registry.markQueueHeartbeat());
         final item = _downloads.removeAt(0);
         state = state.copyWith(
           kind: TransferKind.download,

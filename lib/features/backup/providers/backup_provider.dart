@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:photo_manager/photo_manager.dart';
 import '../../../core/backup/backup_registry.dart';
 import '../../../core/backup/backup_service.dart';
+import '../../../core/backup/connectivity_gate.dart';
 import '../../../core/backup/device_state_bus.dart';
 import '../../transfer/providers/transfer_queue_provider.dart';
 
@@ -91,22 +92,6 @@ class BackupNotifier extends StateNotifier<BackupState> {
     if (value) syncAll(); // pick up anything that was held back on mobile data
   }
 
-  /// True when automatic backup is allowed to run right now: always on
-  /// WiFi/ethernet, on mobile data only if the user opted in. Doesn't apply
-  /// to explicit user actions (Gallery's own "Upload" button, etc.) — only
-  /// the automatic paths below ([syncAlbum]/[syncAll] and the device-change
-  /// watcher).
-  Future<bool> _hasUsableConnection() async {
-    final results = await Connectivity().checkConnectivity();
-    if (results.contains(ConnectivityResult.wifi) ||
-        results.contains(ConnectivityResult.ethernet)) {
-      return true;
-    }
-    if (results.contains(ConnectivityResult.mobile)) {
-      return BackupRegistry.instance.allowMobileData;
-    }
-    return false;
-  }
 
   /// Starts watching for new device photos/videos (to auto-upload them into
   /// enabled albums as they arrive) and for connectivity coming back on WiFi
@@ -205,7 +190,7 @@ class BackupNotifier extends StateNotifier<BackupState> {
   /// video for a long time, with two uncoordinated "queues" fighting over
   /// the same single-file-at-a-time slot. One real queue avoids that.
   Future<void> syncAlbum(AssetPathEntity album) async {
-    if (!await _hasUsableConnection()) return;
+    if (!await hasUsableConnection()) return;
     final count = await album.assetCountAsync;
     if (count == 0) return;
     final assets = await album.getAssetListRange(start: 0, end: count);

@@ -10,6 +10,7 @@ class BackupRegistry {
   static const _fileItemPrefix = 'bk_item_';
   static const _assetForFileItemPrefix = 'bk_asset_';
   static const _allowMobileDataKey = 'bk_allow_mobile_data';
+  static const _queueHeartbeatKey = 'bk_queue_heartbeat_ms';
 
   static final instance = BackupRegistry._();
   BackupRegistry._();
@@ -94,6 +95,28 @@ class BackupRegistry {
 
   Future<void> setAllowMobileData(bool value) =>
       _prefs!.setBool(_allowMobileDataKey, value);
+
+  /// Marks the in-app transfer queue as actively working right now.
+  ///
+  /// The headless periodic background task (see headless_sync.dart) checks
+  /// [queueRecentlyActive] before starting its own upload connection — two
+  /// independent connections uploading to the same account at once is what
+  /// corrupted the Telegram session earlier in this app's life (see
+  /// UploadService's single-connection serialization, which only protects
+  /// callers *within* one process; the background task runs in a separate
+  /// one, so that alone doesn't cover it here).
+  Future<void> markQueueHeartbeat() =>
+      _prefs!.setInt(_queueHeartbeatKey, DateTime.now().millisecondsSinceEpoch);
+
+  /// True if the in-app queue reported activity within the last 45s — long
+  /// enough to comfortably span the gap between two items in a normal
+  /// upload, short enough that a stale heartbeat from a crashed run doesn't
+  /// block the background task forever.
+  bool get queueRecentlyActive {
+    final last = _prefs!.getInt(_queueHeartbeatKey);
+    if (last == null) return false;
+    return DateTime.now().millisecondsSinceEpoch - last < 45000;
+  }
 
   List<String> get enabledAlbumIds =>
       _prefs!.getStringList(_enabledKey) ?? [];
