@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:photo_manager/photo_manager.dart';
+import '../device/device_library.dart';
 import '../upload/upload_service.dart';
 import '../../models/file_item.dart';
 import 'backup_registry.dart';
@@ -57,14 +58,8 @@ class BackupService {
     Future<void> Function(FileItem) addFile,
   ) async {
     final registry = BackupRegistry.instance;
-    final count = await album.assetCountAsync;
-    if (count == 0) {
-      onProgress(const BackupProgress());
-      return;
-    }
-
-    final assets = await album.getAssetListRange(start: 0, end: count);
-    final pending = assets.where((a) => !registry.isUploaded(a.id)).toList();
+    final pending =
+        await DeviceLibrary.instance.pendingFor({album.id}, registry.isUploaded);
 
     if (pending.isEmpty) {
       onProgress(const BackupProgress());
@@ -89,7 +84,10 @@ class BackupService {
       ));
 
       try {
-        final fileItem = await UploadService.instance.uploadFile(file);
+        final fileItem = await UploadService.instance.uploadFile(
+          file,
+          takenAtMs: assetTakenAtMs(asset),
+        );
         await addFile(fileItem);
         await registry.markUploaded(asset.id);
         await registry.linkLocalPath(fileItem.id, file.path);

@@ -1,15 +1,18 @@
 import 'dart:io';
-import 'dart:typed_data';
+import 'dart:math' as math;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:photo_manager/photo_manager.dart';
 import 'package:share_plus/share_plus.dart';
+import '../../../core/backup/asset_upload_service.dart';
 import '../../../core/backup/backup_registry.dart';
 import '../../../core/backup/device_state_bus.dart';
-import '../../../core/upload/upload_service.dart';
+import '../../../core/upload/upload_service.dart' show assetTakenAtMs;
 import '../../backup/providers/backup_provider.dart';
 import '../../explorer/providers/index_provider.dart';
 import '../../explorer/widgets/save_to_device_button.dart';
+import '../../gallery/widgets/scroll_idle.dart';
 import '../../preview/widgets/delete_source_dialog.dart';
 import '../../transfer/providers/transfer_queue_provider.dart';
 import 'device_asset_viewer_screen.dart';
@@ -29,9 +32,21 @@ class DeviceAlbumDetailScreen extends ConsumerStatefulWidget {
 
 class _DeviceAlbumDetailScreenState
     extends ConsumerState<DeviceAlbumDetailScreen> {
+  /// Assets loaded so far, newest first. The album can hold thousands, so it
+  /// is read a page at a time as the user scrolls (see [_loadMore]).
   List<AssetEntity> _assets = [];
+
+  /// Asset count reported by the platform at the last (re)load.
+  int _total = 0;
   bool _loading = true;
+  bool _loadingMore = false;
   String? _error;
+
+  /// Bumped by every reload so an older in-flight page can't clobber newer data.
+  int _gen = 0;
+
+  static const _pageSize = 300;
+  final ScrollController _scroll = ScrollController();
 
   final Set<String> _selected = {};
   bool _selecting = false;
@@ -41,34 +56,95 @@ class _DeviceAlbumDetailScreenState
   @override
   void initState() {
     super.initState();
+    _scroll.addListener(_onScroll);
     _loadAssets();
   }
 
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    if (_scroll.position.extentAfter < 1500) _loadMore();
+  }
+
   Future<void> _loadAssets() async {
+    final gen = ++_gen;
     try {
       final count = await widget.album.assetCountAsync;
-      final assets =
-          count == 0 ? <AssetEntity>[] : await widget.album.getAssetListRange(start: 0, end: count);
-      if (mounted) setState(() { _assets = assets; _loading = false; });
+      final assets = count == 0
+          ? <AssetEntity>[]
+          : await widget.album.getAssetListRange(
+              start: 0, end: math.min(count, _pageSize));
+      if (!mounted || gen != _gen) return;
+      setState(() {
+        _assets = assets;
+        _total = count;
+        _loading = false;
+      });
     } catch (e) {
       // The album can go stale after its last asset was deleted on the
       // device (e.g. via "free up storage") — don't spin forever.
-      if (mounted) setState(() { _error = e.toString(); _loading = false; });
+      if (mounted && gen == _gen) {
+        setState(() { _error = e.toString(); _loading = false; });
+      }
+    }
+  }
+
+  /// Appends the next page. Reads from the current length (not a page index)
+  /// so it stays correct after assets were removed locally.
+  Future<void> _loadMore() async {
+    if (_loadingMore || _loading || _assets.length >= _total) return;
+    _loadingMore = true;
+    final gen = _gen;
+    try {
+      final start = _assets.length;
+      final more = await widget.album.getAssetListRange(
+          start: start, end: math.min(_total, start + _pageSize));
+      if (!mounted || gen != _gen || more.isEmpty) return;
+      setState(() => _assets = [..._assets, ...more]);
+    } catch (_) {
+      // Keep what is already shown; the next scroll retries.
+    } finally {
+      _loadingMore = false;
     }
   }
 
   /// Re-fetches the asset list without toggling the full-screen loading
-  /// spinner — used after returning from the viewer, which may have deleted
-  /// the asset being viewed.
-  Future<void> _refreshAssetsQuietly() async {
+  /// spinner. Unless [force] (pull-to-refresh), it only reloads when the
+  /// platform's asset count changed: device-state bumps fire for every
+  /// upload/delete anywhere in the app, and most don't touch this album.
+  Future<void> _refreshAssetsQuietly({bool force = false}) async {
     try {
-      // photo_manager can otherwise keep answering with pre-mutation counts
-      // for a moment right after a delete/upload.
-      await PhotoManager.clearFileCache();
       final count = await widget.album.assetCountAsync;
-      final assets =
-          count == 0 ? <AssetEntity>[] : await widget.album.getAssetListRange(start: 0, end: count);
-      if (mounted) setState(() => _assets = assets);
+      if (!mounted) return;
+      if (!force && count == _total) {
+        // Same asset count, but a backup may have finished: rebuild so the
+        // "backed up" badges and the selection bar's allUploaded refresh,
+        // without rescanning assets.
+        setState(() {});
+        return;
+      }
+      // Keep as many assets loaded as before (all of them if the user had
+      // already scrolled through the whole album, so new ones show up).
+      final allLoaded = _assets.length >= _total;
+      final want = count == 0
+          ? 0
+          : allLoaded
+              ? count
+              : math.min(count, math.max(_assets.length, _pageSize));
+      final gen = ++_gen;
+      final assets = want == 0
+          ? <AssetEntity>[]
+          : await widget.album.getAssetListRange(start: 0, end: want);
+      if (!mounted || gen != _gen) return;
+      setState(() {
+        _assets = assets;
+        _total = count;
+      });
     } catch (_) {
       // Ignore — the album itself may have gone stale; the existing list
       // stays as-is rather than flashing an error for a background refresh.
@@ -131,7 +207,12 @@ class _DeviceAlbumDetailScreenState
         deletedIds = await PhotoManager.editor.deleteWithIds(chosen.map((a) => a.id).toList());
         if (deletedIds.isNotEmpty) {
           await PhotoManager.clearFileCache();
-          if (mounted) setState(() => _assets.removeWhere((a) => deletedIds.contains(a.id)));
+          if (mounted) {
+            setState(() {
+              _assets.removeWhere((a) => deletedIds.contains(a.id));
+              _total = math.max(0, _total - deletedIds.length);
+            });
+          }
           await ref.read(backupProvider.notifier).refreshDeviceAlbums();
         }
       }
@@ -226,11 +307,12 @@ class _DeviceAlbumDetailScreenState
         if (fileItemId == null) {
           final file = await asset.originFile;
           if (file != null) {
-            final fileItem = await UploadService.instance.uploadFile(file);
-            await ref.read(indexProvider.notifier).addFile(fileItem);
-            await registry.markUploaded(asset.id);
-            await registry.linkLocalPath(fileItem.id, file.path);
-            await registry.linkFileItem(asset.id, fileItem.id);
+            // Pending-index row, then an index save that throws on failure:
+            // the asset is linked (and marked uploaded) only once its file
+            // is in the written index.
+            final fileItem = await AssetUploadService.instance
+                .uploadAndLinkFile(ref, asset.id, file,
+                    takenAtMs: assetTakenAtMs(asset));
             fileItemId = fileItem.id;
           }
         }
@@ -294,19 +376,25 @@ class _DeviceAlbumDetailScreenState
     ref.listen(deviceStateVersion, (prev, next) {
       if (prev != next) _refreshAssetsQuietly();
     });
-    ref.listen(indexProvider, (prev, next) {
-      if (next.mutationError != null && next.mutationError != prev?.mutationError) {
+    ref.listen(indexProvider.select((s) => s.mutationError), (prev, next) {
+      if (next != null && next != prev) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Action failed: ${next.mutationError}')),
+          SnackBar(content: Text('Action failed: $next')),
         );
       }
     });
-    final backup = ref.watch(backupProvider);
-    final isEnabled = backup.isEnabled(widget.album.id);
-    final progress = backup.progressFor(widget.album.id);
+    // Only this album's flag; sync progress ticks live in [_BackupBanner].
+    final albumId = widget.album.id;
+    final isEnabled =
+        ref.watch(backupProvider.select((s) => s.isEnabled(albumId)));
     final registry = BackupRegistry.instance;
-    final selectedAssets = _assets.where((a) => _selected.contains(a.id));
-    final allUploaded = selectedAssets.isNotEmpty && selectedAssets.every((a) => registry.isUploaded(a.id));
+    var allUploaded = false;
+    if (_selecting) {
+      final selectedAssets =
+          _assets.where((a) => _selected.contains(a.id)).toList();
+      allUploaded = selectedAssets.isNotEmpty &&
+          selectedAssets.every((a) => registry.isUploaded(a.id));
+    }
 
     return Scaffold(
       appBar: _selecting
@@ -384,12 +472,7 @@ class _DeviceAlbumDetailScreenState
             ),
       body: Column(
         children: [
-          if (progress != null && !progress.isDone && !progress.isIdle)
-            _SyncBanner(
-              done: progress.done,
-              total: progress.total,
-              currentName: progress.currentName,
-            ),
+          _BackupBanner(albumId: albumId),
           if (_uploadTotal != null)
             _SyncBanner(done: _uploadDone, total: _uploadTotal!),
           Expanded(
@@ -408,7 +491,7 @@ class _DeviceAlbumDetailScreenState
                       )
                     : _assets.isEmpty
                     ? RefreshIndicator(
-                        onRefresh: _refreshAssetsQuietly,
+                        onRefresh: () => _refreshAssetsQuietly(force: true),
                         child: ListView(
                           children: const [
                             Padding(
@@ -422,49 +505,74 @@ class _DeviceAlbumDetailScreenState
                         ),
                       )
                     : RefreshIndicator(
-                        onRefresh: _refreshAssetsQuietly,
-                        child: GridView.builder(
-                          padding: const EdgeInsets.all(2),
-                          gridDelegate:
-                              const SliverGridDelegateWithMaxCrossAxisExtent(
-                            maxCrossAxisExtent: 120,
-                            crossAxisSpacing: 2,
-                            mainAxisSpacing: 2,
-                          ),
-                          itemCount: _assets.length,
-                          itemBuilder: (context, i) {
-                            final asset = _assets[i];
-                            return _AssetTile(
-                              asset: asset,
-                              backed: isEnabled &&
-                                  BackupRegistry.instance.isUploaded(asset.id),
-                              selected: _selected.contains(asset.id),
-                              onTap: () {
-                                if (_selecting) {
-                                  _toggle(asset.id);
-                                } else {
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute(
-                                      builder: (_) => DeviceAssetViewerScreen(
-                                        assets: _assets,
-                                        initialIndex: i,
+                        onRefresh: () => _refreshAssetsQuietly(force: true),
+                        child: ScrollIdleTracker(
+                          child: GridView.builder(
+                            controller: _scroll,
+                            padding: const EdgeInsets.all(2),
+                            gridDelegate:
+                                const SliverGridDelegateWithMaxCrossAxisExtent(
+                              maxCrossAxisExtent: 120,
+                              crossAxisSpacing: 2,
+                              mainAxisSpacing: 2,
+                            ),
+                            itemCount: _assets.length,
+                            itemBuilder: (context, i) {
+                              final asset = _assets[i];
+                              return _AssetTile(
+                                key: ValueKey(asset.id),
+                                asset: asset,
+                                backed: isEnabled && registry.isUploaded(asset.id),
+                                selected: _selected.contains(asset.id),
+                                onTap: () {
+                                  if (_selecting) {
+                                    _toggle(asset.id);
+                                  } else {
+                                    Navigator.of(context).push(
+                                      MaterialPageRoute(
+                                        builder: (_) => DeviceAssetViewerScreen(
+                                          assets: _assets,
+                                          initialIndex: i,
+                                        ),
                                       ),
-                                    ),
-                                    // The viewer may have deleted this asset — refresh so
-                                    // the grid doesn't keep showing (and crash opening) it.
-                                  ).then((_) => _refreshAssetsQuietly());
-                                }
-                              },
-                              onLongPress: () => _selecting
-                                  ? _toggle(asset.id)
-                                  : _startSelection(asset.id),
-                            );
-                          },
+                                      // The viewer may have deleted this asset — refresh so
+                                      // the grid doesn't keep showing (and crash opening) it.
+                                    ).then((_) => _refreshAssetsQuietly());
+                                  }
+                                },
+                                onLongPress: () => _selecting
+                                    ? _toggle(asset.id)
+                                    : _startSelection(asset.id),
+                              );
+                            },
+                          ),
                         ),
                       ),
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Sync-progress banner for this album. A leaf widget so per-file progress
+/// ticks rebuild only the banner, not the whole screen and grid.
+class _BackupBanner extends ConsumerWidget {
+  const _BackupBanner({required this.albumId});
+
+  final String albumId;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final progress =
+        ref.watch(backupProvider.select((s) => s.progressFor(albumId)));
+    if (progress == null || progress.isDone || progress.isIdle) {
+      return const SizedBox.shrink();
+    }
+    return _SyncBanner(
+      done: progress.done,
+      total: progress.total,
+      currentName: progress.currentName,
     );
   }
 }
@@ -508,6 +616,7 @@ class _SyncBanner extends StatelessWidget {
 /// asset has already been backed up, or a selection checkmark in select mode.
 class _AssetTile extends StatefulWidget {
   const _AssetTile({
+    super.key,
     required this.asset,
     required this.backed,
     required this.selected,
@@ -527,22 +636,62 @@ class _AssetTile extends StatefulWidget {
 
 class _AssetTileState extends State<_AssetTile> {
   Uint8List? _thumb;
+  bool _loading = false;
+  ValueListenable<bool>? _scrollIdle;
 
   @override
-  void initState() {
-    super.initState();
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Same gating as GalleryTile: no thumbnail request while the grid is
+    // moving, so a fast fling doesn't queue a platform-channel read for every
+    // tile that flashes past.
+    final idle = ScrollIdle.maybeOf(context);
+    if (idle != _scrollIdle) {
+      _scrollIdle?.removeListener(_maybeLoad);
+      _scrollIdle = idle;
+      _scrollIdle?.addListener(_maybeLoad);
+    }
+    _maybeLoad();
+  }
+
+  @override
+  void didUpdateWidget(_AssetTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // A recycled tile for another asset must not keep the old thumbnail.
+    if (oldWidget.asset.id != widget.asset.id) {
+      _thumb = null;
+      _loading = false;
+      _maybeLoad();
+    }
+  }
+
+  @override
+  void dispose() {
+    _scrollIdle?.removeListener(_maybeLoad);
+    super.dispose();
+  }
+
+  void _maybeLoad() {
+    if (_thumb != null || _loading) return;
+    if (_scrollIdle?.value == false) return;
     _loadThumb();
   }
 
   Future<void> _loadThumb() async {
+    _loading = true;
+    final asset = widget.asset;
     try {
-      final data = await widget.asset.thumbnailDataWithSize(
+      final data = await asset.thumbnailDataWithSize(
         const ThumbnailSize(200, 200),
       );
-      if (mounted && data != null) setState(() => _thumb = data);
+      if (mounted && data != null && asset.id == widget.asset.id) {
+        setState(() => _thumb = data);
+      }
     } catch (_) {
       // The asset may have just been deleted from the device — keep showing
       // the placeholder instead of an unhandled exception.
+    } finally {
+      if (asset.id == widget.asset.id) _loading = false;
     }
   }
 
@@ -559,7 +708,12 @@ class _AssetTileState extends State<_AssetTile> {
           fit: StackFit.expand,
           children: [
             if (_thumb != null)
-              Image.memory(_thumb!, fit: BoxFit.cover)
+              Image.memory(
+                _thumb!,
+                fit: BoxFit.cover,
+                cacheWidth: 300,
+                gaplessPlayback: true,
+              )
             else
               Center(
                 child: Icon(

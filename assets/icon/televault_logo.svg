@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="40 30 170 170">
+  <defs>
+    <clipPath id="tile"><rect x="40" y="30" width="170" height="170" rx="38"/></clipPath>
+  </defs>
+  <g clip-path="url(#tile)">
+    <rect x="40" y="30" width="170" height="170" fill="#2AABEE"/>
+    <g fill="#8FD3F7"><circle cx="70" cy="66" r="11"/><circle cx="86" cy="58" r="15"/><circle cx="102" cy="68" r="9"/><rect x="59" y="66" width="52" height="11" rx="5.5"/></g>
+    <g fill="#6CC5F4"><circle cx="102" cy="138" r="24"/><circle cx="136" cy="118" r="32"/><circle cx="170" cy="140" r="21"/><rect x="78" y="138" width="114" height="26" rx="13"/></g>
+    <g fill="#8FD3F7"><circle cx="180" cy="88" r="10"/><circle cx="194" cy="81" r="13"/><circle cx="207" cy="90" r="8"/><rect x="170" y="88" width="45" height="10" rx="5"/></g>
+    <polygon points="64,118 174,64 138,156 120,124" fill="#FFFFFF"/>
+    <polygon points="120,124 174,64 113,142" fill="#D6EEFB"/>
+  </g>
+</svg>

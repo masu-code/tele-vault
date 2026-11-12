@@ -1,10 +1,14 @@
 import 'package:disk_space_plus/disk_space_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../core/backup/backup_registry.dart';
 import '../../../core/format_utils.dart';
+import '../../archive/screens/archive_screen.dart';
 import '../../backup/providers/backup_provider.dart';
+import '../../explorer/providers/index_provider.dart';
 import '../../transfer/widgets/transfer_progress_bar.dart';
 import '../providers/profile_provider.dart';
+import 'backfill_screen.dart';
 import 'free_up_storage_screen.dart';
 
 /// Bottom sheet shown when tapping the profile avatar: Telegram account
@@ -62,7 +66,13 @@ class AccountSheet extends ConsumerWidget {
             const SizedBox(height: 12),
             const _StorageCard(),
             const SizedBox(height: 12),
+            _ArchivedButton(),
+            const SizedBox(height: 12),
+            const _BackfillButton(),
+            const SizedBox(height: 12),
             const _MobileDataToggle(),
+            const SizedBox(height: 8),
+            const _HeadlessStatus(),
           ],
         ),
       ),
@@ -149,6 +159,116 @@ class _StorageCardState extends State<_StorageCard> {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Entry point to [ArchiveScreen] — archived photos/videos are hidden from
+/// Gallery/Albums but not deleted (see [FileIndex.archivedMediaFiles]).
+class _ArchivedButton extends ConsumerWidget {
+  const _ArchivedButton();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final count = ref.watch(
+      indexProvider.select((s) => s.index.archivedMediaFiles.length),
+    );
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF1C1C1E),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: ListTile(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        leading: const Icon(Icons.archive_outlined, color: Color(0xFF2AABEE)),
+        title: const Text('Archived'),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (count > 0)
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: Text('$count', style: const TextStyle(color: Colors.white54)),
+              ),
+            const Icon(Icons.chevron_right, color: Colors.white38),
+          ],
+        ),
+        onTap: () {
+          Navigator.pop(context);
+          Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const ArchiveScreen()),
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// Entry point to [BackfillScreen] (thumbnails for old cloud items).
+class _BackfillButton extends StatelessWidget {
+  const _BackfillButton();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF1C1C1E),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: ListTile(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        leading: const Icon(Icons.photo_library_outlined, color: Color(0xFF2AABEE)),
+        title: const Text('Thumbnail backfill'),
+        trailing: const Icon(Icons.chevron_right, color: Colors.white38),
+        onTap: () {
+          Navigator.pop(context);
+          Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const BackfillScreen()),
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// When the background (app-closed) backup task last ran and what it did.
+/// A missing or old timestamp means Android/MIUI isn't running the task at all
+/// (battery restrictions / autostart); a recent one with a skip reason says
+/// exactly why nothing was uploaded.
+class _HeadlessStatus extends StatelessWidget {
+  const _HeadlessStatus();
+
+  Future<({DateTime at, String status})?> _load() async {
+    final registry = BackupRegistry.instance;
+    await registry.init();
+    await registry.reload();
+    return registry.lastHeadlessRun;
+  }
+
+  String _ago(DateTime at) {
+    final d = DateTime.now().difference(at);
+    if (d.inMinutes < 1) return 'just now';
+    if (d.inMinutes < 60) return '${d.inMinutes} min ago';
+    if (d.inHours < 48) return '${d.inHours} h ago';
+    return '${d.inDays} days ago';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder(
+      future: _load(),
+      builder: (context, snap) {
+        if (snap.connectionState != ConnectionState.done) return const SizedBox.shrink();
+        final run = snap.data;
+        final text = run == null
+            ? 'Background backup has never run (check Autostart and battery '
+                '"No restrictions" for TeleVault in system settings)'
+            : 'Background backup ran ${_ago(run.at)}: ${run.status}';
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text(text, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+        );
+      },
     );
   }
 }

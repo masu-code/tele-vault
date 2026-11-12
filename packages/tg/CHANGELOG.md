@@ -1,0 +1,63 @@
+## 0.0.20
+
+ - Update README.md noting the package supports all `t` versions from 218 and above.
+
+ ## 0.0.19
+
+ - Fix msgsAck broken by previous PR (#16) (#17)
+
+## 0.0.18
+
+ - Fix BadServerSalt and send MsgsAck packets (#16)
+
+## 0.0.17
+
+ - Use Random sessionId (#15)
+
+## 0.0.16
+
+ - Update `t` version.
+ 
+ ## 0.0.14
+
+ - Faster password cryptography thanks to @Ilham-Habibullin.
+
+ ## 0.0.13
+
+ - Added a working example.
+ 
+ ## 0.0.12
+
+ - Better Session and AuthorizationKey management.
+
+## 0.0.11
+
+- AuthorizationKey and Session classes moved here from `t`.
+
+## 0.0.10
+
+- Format code and update dependency version.
+
+## 0.0.9
+
+- Handle multiple frames in a single packet.
+
+## 0.0.8
+
+- Handle GzipPacked messages and Replace built-in AES-CTR with one from Pointycastle.
+
+## 0.0.4
+
+- Client base class.
+
+## 0.0.3
+
+- Login functionality.
+
+## 0.0.2
+
+- Refactor MTProto objects into https://pub.dev/packages/t.
+
+## 0.0.1
+
+- Initial version with Schema and Obfuscation.

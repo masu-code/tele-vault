@@ -19,14 +19,14 @@
 
 param(
     [switch]$CaptureSession,
-    [string]$Device = "DEVICE_SERIAL",
+    [string]$Device = $env:TV_DEVICE,
     [string]$Package = "com.masucode.tele_vault",
     [string]$SessionFile = "$env:USERPROFILE\.tele_vault_device_session.json"
 )
 
 $ErrorActionPreference = "Stop"
-$adb = "%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe"
-$flutter = "%FLUTTER_ROOT%\bin\flutter.bat"
+$adb = if ($env:ANDROID_HOME) { Join-Path $env:ANDROID_HOME "platform-tools\adb.exe" } else { Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe" }
+$flutter = (Get-Command flutter -ErrorAction Stop).Source
 $projectDir = Split-Path $PSScriptRoot -Parent
 
 if ($CaptureSession) {

@@ -4,17 +4,20 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:photo_manager/photo_manager.dart';
 import '../../../core/backup/backup_registry.dart';
 import '../../../core/backup/device_state_bus.dart';
+import '../../../core/diag/tv_stats.dart';
 import '../../../core/local_storage/local_file_service.dart';
 import '../../download/providers/download_provider.dart';
 import '../../preview/screens/media_viewer_screen.dart';
 import '../../preview/widgets/delete_source_dialog.dart';
 import '../../profile/widgets/floating_profile_header.dart';
 import '../../upload/providers/upload_provider.dart';
-import '../../../models/file_index.dart';
 import '../../../models/file_item.dart';
 import '../../../models/folder.dart';
+import '../../gallery/widgets/scroll_idle.dart';
 import '../../shell/scroll_to_top.dart';
 import '../providers/index_provider.dart';
+import '../providers/saved_ids_provider.dart';
+import '../providers/select_helpers.dart';
 import '../widgets/file_thumbnail.dart';
 import '../widgets/save_to_device_button.dart';
 
@@ -44,6 +47,10 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
 
   final ScrollController _scrollController = ScrollController();
 
+  /// A device-state bump arrived while this tab was hidden; refresh the
+  /// saved-on-device flags once it is visible again.
+  bool _savedStale = false;
+
   @override
   void dispose() {
     _scrollController.dispose();
@@ -66,27 +73,29 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
   void _goUp() => setState(() => _path.removeLast());
 
   void _exitSelection() => setState(() {
-        _selecting = false;
-        _selFiles.clear();
-        _selFolders.clear();
-      });
+    _selecting = false;
+    _selFiles.clear();
+    _selFolders.clear();
+  });
 
   void _toggleFile(FileItem f) => setState(() {
-        if (!_selFiles.remove(f.id)) _selFiles.add(f.id);
-        _selecting = _selCount > 0;
-      });
+    if (!_selFiles.remove(f.id)) _selFiles.add(f.id);
+    _selecting = _selCount > 0;
+  });
 
   void _toggleFolder(Folder f) => setState(() {
-        if (!_selFolders.remove(f.id)) _selFolders.add(f.id);
-        _selecting = _selCount > 0;
-      });
+    if (!_selFolders.remove(f.id)) _selFolders.add(f.id);
+    _selecting = _selCount > 0;
+  });
 
   /// Images and videos preview in-app; everything else opens with the system.
   void _openFile(FileItem file) {
     final mime = file.mimeType;
     if (mime.startsWith('image/') || mime.startsWith('video/')) {
       Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => MediaViewerScreen(items: [file], initialIndex: 0)),
+        MaterialPageRoute(
+          builder: (_) => MediaViewerScreen(items: [file], initialIndex: 0),
+        ),
       );
     } else {
       ref.read(downloadProvider.notifier).openWithSystem(file);
@@ -106,7 +115,10 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
           onSubmitted: (v) => Navigator.of(ctx).pop(v.trim()),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel'),
+          ),
           FilledButton(
             onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
             child: const Text('OK'),
@@ -119,11 +131,14 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
   Future<void> _createFolderDialog() async {
     final name = await _promptName('New folder');
     if (name != null && name.isNotEmpty) {
-      await ref.read(indexProvider.notifier).createFolder(name, parentId: _currentFolderId);
+      await ref
+          .read(indexProvider.notifier)
+          .createFolder(name, parentId: _currentFolderId);
     }
   }
 
-  Future<void> _renameSelected(FileIndex index) async {
+  Future<void> _renameSelected() async {
+    final index = ref.read(indexProvider).index;
     if (_selFiles.length == 1 && _selFolders.isEmpty) {
       final file = index.files.firstWhere((f) => f.id == _selFiles.first);
       final name = await _promptName('Rename file', initial: file.name);
@@ -140,14 +155,16 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
     _exitSelection();
   }
 
-  Future<void> _moveSelected(FileIndex index) async {
+  Future<void> _moveSelected() async {
+    final index = ref.read(indexProvider).index;
     // Can't move a folder into itself or its own subtree.
     final excluded = <String>{..._selFolders};
     for (final fid in _selFolders) {
       excluded.addAll(index.descendantFolderIds(fid));
     }
-    final candidates =
-        index.folders.where((f) => !excluded.contains(f.id)).toList();
+    final candidates = index.folders
+        .where((f) => !excluded.contains(f.id))
+        .toList();
     final byId = {for (final f in index.folders) f.id: f};
 
     String pathOf(Folder f) {
@@ -168,7 +185,10 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
           children: [
             const Padding(
               padding: EdgeInsets.all(16),
-              child: Text('Move to…', style: TextStyle(fontWeight: FontWeight.bold)),
+              child: Text(
+                'Move to…',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
             ),
             ListTile(
               leading: const Icon(Icons.home_outlined),
@@ -192,13 +212,15 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
     _exitSelection();
   }
 
-  Future<void> _saveSelected(FileIndex index) async {
+  Future<void> _saveSelected() async {
+    final index = ref.read(indexProvider).index;
     final files = index.files.where((f) => _selFiles.contains(f.id)).toList();
     _exitSelection();
     await ref.read(downloadProvider.notifier).saveManyToDevice(files);
   }
 
-  Future<void> _deleteSelected(FileIndex index) async {
+  Future<void> _deleteSelected() async {
+    final index = ref.read(indexProvider).index;
     final files = index.files.where((f) => _selFiles.contains(f.id)).toList();
     final folderIds = _selFolders.toList();
     if (files.isEmpty && folderIds.isEmpty) return;
@@ -206,11 +228,17 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
     final registry = BackupRegistry.instance;
     // Same lookup the on-device icon uses — checking BackupRegistry.localPathFor
     // alone misses files saved via the explicit "Save to device" download.
-    final matches = await Future.wait(files.map(LocalFileService.instance.existingLocalFile));
+    final matches = await Future.wait(
+      files.map(LocalFileService.instance.existingLocalFile),
+    );
     final anyOnDevice = matches.any((m) => m != null);
     if (!mounted) return;
 
-    final source = await askDeleteSource(context, existsOnDevice: anyOnDevice, existsInCloud: true);
+    final source = await askDeleteSource(
+      context,
+      existsOnDevice: anyOnDevice,
+      existsInCloud: true,
+    );
     if (source == null) return;
 
     if (source == DeleteSource.cloud || source == DeleteSource.both) {
@@ -242,43 +270,79 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    TvStats.screenBuild('explorer');
     ref.listen(scrollToTopProvider, (prev, next) {
       if (next != null && next.tabIndex == 2) _scrollToTop();
     });
-    final state = ref.watch(indexProvider);
-    final upload = ref.watch(uploadProvider);
-    final index = state.index;
-    final folders = index.foldersIn(_currentFolderId);
-    final files = index.filesIn(_currentFolderId);
-
-    ref.listen(uploadProvider, (prev, next) {
-      if (next.error != null && next.error != prev?.error) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Upload failed: ${next.error}')),
+    // Narrow watches. This screen lives in an IndexedStack, so a whole-provider
+    // watch rebuilt it on every upload progress tick and index change even
+    // when it was not on screen. Upload progress lives in [_UploadBanner].
+    final listing = ref.watch(
+      indexProvider.select((s) {
+        final id = _currentFolderId;
+        return _Listing(
+          IdentityList(s.index.foldersIn(id)),
+          IdentityList(s.index.filesIn(id)),
         );
+      }),
+    );
+    final isLoading = ref.watch(indexProvider.select((s) => s.isLoading));
+    final loadError = ref.watch(indexProvider.select((s) => s.error));
+    final isSaving = ref.watch(indexProvider.select((s) => s.isSaving));
+    final isUploading = ref.watch(uploadProvider.select((u) => u.isUploading));
+    final folders = listing.folders.items;
+    final files = listing.files.items;
+
+    ref.listen(uploadProvider.select((u) => u.error), (prev, next) {
+      if (next != null && next != prev) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Upload failed: $next')));
       }
     });
-    ref.listen(indexProvider, (prev, next) {
-      if (next.mutationError != null && next.mutationError != prev?.mutationError) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Action failed: ${next.mutationError}')),
-        );
+    ref.listen(indexProvider.select((s) => s.mutationError), (prev, next) {
+      if (next != null && next != prev) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Action failed: $next')));
       }
     });
     ref.listen(downloadProvider, (prev, next) {
       if (next.error != null && next.error != prev?.error) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed: ${next.error}')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Failed: ${next.error}')));
       }
-      if (next.savedMessage != null && next.savedMessage != prev?.savedMessage) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(next.savedMessage!)));
+      if (next.savedMessage != null &&
+          next.savedMessage != prev?.savedMessage) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(next.savedMessage!)));
       }
     });
+    // One list-level listener refreshes the shared saved-on-device flags
+    // (instead of every row listening and hitting the disk on its own).
+    // While the tab is hidden the refresh is deferred until it is visible.
+    ref.listen(deviceStateVersion, (prev, next) {
+      if (prev == next) return;
+      if (TickerMode.getValuesNotifier(context).value.enabled) {
+        ref.read(savedIdsProvider.notifier).refreshAlive();
+      } else {
+        _savedStale = true;
+      }
+    });
+    if (_savedStale && TickerMode.valuesOf(context).enabled) {
+      _savedStale = false;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) ref.read(savedIdsProvider.notifier).refreshAlive();
+      });
+    }
 
     final atRoot = _path.isEmpty;
     final topInset = MediaQuery.of(context).padding.top + kToolbarHeight;
 
     return Scaffold(
-      appBar: _selecting ? _selectionAppBar(index) : null,
+      appBar: _selecting ? _selectionAppBar() : null,
       floatingActionButton: _selecting
           ? null
           : Column(
@@ -293,9 +357,11 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
                 const SizedBox(height: 12),
                 FloatingActionButton.extended(
                   heroTag: 'upload',
-                  onPressed: upload.isUploading
+                  onPressed: isUploading
                       ? null
-                      : () => ref.read(uploadProvider.notifier).pickAndUpload(folderId: _currentFolderId),
+                      : () => ref
+                            .read(uploadProvider.notifier)
+                            .pickAndUpload(folderId: _currentFolderId),
                   icon: const Icon(Icons.upload_file),
                   label: const Text('Upload'),
                 ),
@@ -306,14 +372,18 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
           DropTarget(
             onDragDone: (detail) {
               final paths = detail.files.map((f) => f.path).toList();
-              ref.read(uploadProvider.notifier).uploadPaths(paths, folderId: _currentFolderId);
+              ref
+                  .read(uploadProvider.notifier)
+                  .uploadPaths(paths, folderId: _currentFolderId);
             },
             child: Column(
               children: [
                 SizedBox(height: _selecting ? 0 : topInset),
                 if (_path.isNotEmpty) _breadcrumb(),
-                if (upload.isUploading) _uploadBanner(upload),
-                Expanded(child: _buildBody(state, folders, files)),
+                const _UploadBanner(),
+                Expanded(
+                  child: _buildBody(isLoading, loadError, folders, files),
+                ),
               ],
             ),
           ),
@@ -322,11 +392,14 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
               title: atRoot ? 'Files' : _path.last.name,
               onBack: atRoot ? null : _goUp,
               actions: [
-                if (state.isSaving)
+                if (isSaving)
                   const Padding(
                     padding: EdgeInsets.all(16),
                     child: SizedBox(
-                        width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
                   ),
                 IconButton(
                   icon: const Icon(Icons.refresh),
@@ -339,21 +412,24 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
     );
   }
 
-  PreferredSizeWidget _selectionAppBar(FileIndex index) {
+  PreferredSizeWidget _selectionAppBar() {
     return AppBar(
-      leading: IconButton(icon: const Icon(Icons.close), onPressed: _exitSelection),
+      leading: IconButton(
+        icon: const Icon(Icons.close),
+        onPressed: _exitSelection,
+      ),
       title: Text('$_selCount selected'),
       actions: [
         if (_selCount == 1)
           IconButton(
             icon: const Icon(Icons.drive_file_rename_outline),
             tooltip: 'Rename',
-            onPressed: () => _renameSelected(index),
+            onPressed: _renameSelected,
           ),
         IconButton(
           icon: const Icon(Icons.drive_file_move_outline),
           tooltip: 'Move to folder',
-          onPressed: () => _moveSelected(index),
+          onPressed: _moveSelected,
         ),
         if (_selFiles.isNotEmpty) ...[
           IconButton(
@@ -361,19 +437,19 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
             tooltip: 'Share',
             onPressed: () => shareCloudFiles(
               context,
-              index.filesByIds(_selFiles.toList()),
+              ref.read(indexProvider).index.filesByIds(_selFiles.toList()),
             ),
           ),
           IconButton(
             icon: const Icon(Icons.download_outlined),
             tooltip: 'Save to device',
-            onPressed: () => _saveSelected(index),
+            onPressed: _saveSelected,
           ),
         ],
         IconButton(
           icon: const Icon(Icons.delete_outline),
           tooltip: 'Delete',
-          onPressed: () => _deleteSelected(index),
+          onPressed: _deleteSelected,
         ),
       ],
     );
@@ -391,40 +467,27 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
     );
   }
 
-  Widget _uploadBanner(UploadState upload) {
-    return Material(
-      color: const Color(0xFF14303F),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              upload.totalCount > 1
-                  ? 'Uploading ${upload.currentIndex}/${upload.totalCount}: ${upload.fileName ?? ''}  ${(upload.progress * 100).toStringAsFixed(0)}%'
-                  : 'Uploading ${upload.fileName ?? ''}  ${(upload.progress * 100).toStringAsFixed(0)}%',
-              style: const TextStyle(fontSize: 12),
-            ),
-            const SizedBox(height: 6),
-            LinearProgressIndicator(value: upload.progress == 0 ? null : upload.progress),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildBody(IndexState state, List<Folder> folders, List<FileItem> files) {
-    if (state.isLoading) return const Center(child: CircularProgressIndicator());
-    if (state.error != null) {
+  Widget _buildBody(
+    bool isLoading,
+    String? loadError,
+    List<Folder> folders,
+    List<FileItem> files,
+  ) {
+    if (isLoading) return const Center(child: CircularProgressIndicator());
+    if (loadError != null) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              const Icon(Icons.error_outline, size: 48, color: Colors.redAccent),
+              const Icon(
+                Icons.error_outline,
+                size: 48,
+                color: Colors.redAccent,
+              ),
               const SizedBox(height: 12),
-              Text(state.error!, textAlign: TextAlign.center),
+              Text(loadError, textAlign: TextAlign.center),
             ],
           ),
         ),
@@ -432,30 +495,47 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
     }
     if (folders.isEmpty && files.isEmpty) {
       return const Center(
-        child: Text('Empty folder.\nTap + to create a folder or Upload a file.',
-            textAlign: TextAlign.center, style: TextStyle(color: Colors.white54)),
+        child: Text(
+          'Empty folder.\nTap + to create a folder or Upload a file.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.white54),
+        ),
       );
     }
-    return ListView(
-      controller: _scrollController,
-      children: [
-        for (final folder in folders)
-          ListTile(
-            key: ValueKey('folder_${folder.id}'),
-            selected: _selFolders.contains(folder.id),
-            selectedTileColor: const Color(0x222AABEE),
-            leading: const Icon(Icons.folder, color: Color(0xFF2AABEE)),
-            title: Text(folder.name),
-            onTap: () => _selecting ? _toggleFolder(folder) : _openFolder(folder),
-            onLongPress: () => _toggleFolder(folder),
-            trailing: _selecting
-                ? Icon(_selFolders.contains(folder.id)
-                    ? Icons.check_circle
-                    : Icons.circle_outlined)
-                : null,
-          ),
-        for (final file in files)
-          ListTile(
+    // ListView.builder, not a ListView with an eagerly-built children list:
+    // a folder with hundreds of files used to build every single ListTile
+    // (and kick off every single FileThumbnail's request) the moment the
+    // screen built, regardless of how many were actually visible — the same
+    // shape of problem the gallery grid had, just without a scroll to
+    // trigger it since it all happened once up front. Builder mode defers
+    // each row until the list actually scrolls it into view.
+    return ScrollIdleTracker(
+      child: ListView.builder(
+        controller: _scrollController,
+        itemCount: folders.length + files.length,
+        itemBuilder: (context, i) {
+          if (i < folders.length) {
+            final folder = folders[i];
+            return ListTile(
+              key: ValueKey('folder_${folder.id}'),
+              selected: _selFolders.contains(folder.id),
+              selectedTileColor: const Color(0x222AABEE),
+              leading: const Icon(Icons.folder, color: Color(0xFF2AABEE)),
+              title: Text(folder.name),
+              onTap: () =>
+                  _selecting ? _toggleFolder(folder) : _openFolder(folder),
+              onLongPress: () => _toggleFolder(folder),
+              trailing: _selecting
+                  ? Icon(
+                      _selFolders.contains(folder.id)
+                          ? Icons.check_circle
+                          : Icons.circle_outlined,
+                    )
+                  : null,
+            );
+          }
+          final file = files[i - folders.length];
+          return ListTile(
             key: ValueKey('file_${file.id}'),
             selected: _selFiles.contains(file.id),
             selectedTileColor: const Color(0x222AABEE),
@@ -465,16 +545,21 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
               fallbackIcon: _iconFor(file),
             ),
             title: Text(file.name),
-            subtitle: Text('${file.parts.length} part(s) · ${_humanSize(file.totalSize)}'),
+            subtitle: Text(
+              '${file.parts.length} part(s) · ${_humanSize(file.totalSize)}',
+            ),
             onTap: () => _selecting ? _toggleFile(file) : _openFile(file),
             onLongPress: () => _toggleFile(file),
             trailing: _selecting
-                ? Icon(_selFiles.contains(file.id)
-                    ? Icons.check_circle
-                    : Icons.circle_outlined)
+                ? Icon(
+                    _selFiles.contains(file.id)
+                        ? Icons.check_circle
+                        : Icons.circle_outlined,
+                  )
                 : SaveToDeviceButton(file: file),
-          ),
-      ],
+          );
+        },
+      ),
     );
   }
 
@@ -496,5 +581,54 @@ class _ExplorerScreenState extends ConsumerState<ExplorerScreen> {
       unit++;
     }
     return '${size.toStringAsFixed(unit == 0 ? 0 : 1)} ${units[unit]}';
+  }
+}
+
+/// Folders and files of the open folder, compared by element identity so the
+/// screen only rebuilds when this listing actually changed.
+class _Listing {
+  const _Listing(this.folders, this.files);
+
+  final IdentityList<Folder> folders;
+  final IdentityList<FileItem> files;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _Listing && other.folders == folders && other.files == files;
+
+  @override
+  int get hashCode => Object.hash(folders, files);
+}
+
+/// Upload progress banner. A leaf widget so per-tick progress updates rebuild
+/// only this banner, not the whole file list.
+class _UploadBanner extends ConsumerWidget {
+  const _UploadBanner();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final upload = ref.watch(uploadProvider);
+    if (!upload.isUploading) return const SizedBox.shrink();
+    return Material(
+      color: const Color(0xFF14303F),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              upload.totalCount > 1
+                  ? 'Uploading ${upload.currentIndex}/${upload.totalCount}: ${upload.fileName ?? ''}  ${(upload.progress * 100).toStringAsFixed(0)}%'
+                  : 'Uploading ${upload.fileName ?? ''}  ${(upload.progress * 100).toStringAsFixed(0)}%',
+              style: const TextStyle(fontSize: 12),
+            ),
+            const SizedBox(height: 6),
+            LinearProgressIndicator(
+              value: upload.progress == 0 ? null : upload.progress,
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }

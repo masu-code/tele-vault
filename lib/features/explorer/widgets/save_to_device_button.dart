@@ -1,10 +1,9 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../../../core/backup/device_state_bus.dart';
-import '../../../core/local_storage/local_file_service.dart';
 import '../../../models/file_item.dart';
 import '../../download/providers/download_provider.dart';
+import '../providers/saved_ids_provider.dart';
 
 /// Icon used everywhere to mean "already on this device" (Gallery, Albums,
 /// Files) — kept as one constant so the indicator stays visually consistent.
@@ -25,41 +24,45 @@ class SaveToDeviceButton extends ConsumerStatefulWidget {
 }
 
 class _SaveToDeviceButtonState extends ConsumerState<SaveToDeviceButton> {
-  bool _saved = false;
+  late final SavedIdsNotifier _saved;
 
   @override
   void initState() {
     super.initState();
-    _refresh();
+    _saved = ref.read(savedIdsProvider.notifier);
+    _saved.register(widget.file);
   }
 
   @override
   void didUpdateWidget(SaveToDeviceButton oldWidget) {
     super.didUpdateWidget(oldWidget);
     // If this widget is recycled for a different file (list reorder/filter),
-    // its cached saved-state no longer applies — recheck.
+    // its saved-state no longer applies — register the new one.
     if (oldWidget.file.id != widget.file.id) {
-      setState(() => _saved = false);
-      _refresh();
+      _saved.unregister(oldWidget.file.id);
+      _saved.register(widget.file);
     }
   }
 
-  Future<void> _refresh() async {
-    final saved = await LocalFileService.instance.isSaved(widget.file);
-    if (mounted) setState(() => _saved = saved);
+  @override
+  void dispose() {
+    _saved.unregister(widget.file.id);
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final download = ref.watch(downloadProvider);
-    // ExplorerScreen is kept alive in an IndexedStack, so without this the
-    // cached _saved flag would never notice a delete/save that happened
-    // elsewhere (Gallery, Albums, the viewer) and stay stale forever.
-    ref.listen(deviceStateVersion, (prev, next) {
-      if (prev != next) _refresh();
-    });
+    final id = widget.file.id;
+    // Narrow watches: only the row being downloaded rebuilds on progress, and
+    // a row only rebuilds when its own saved flag flips. Staleness after a
+    // delete/save elsewhere is handled by the list-level listener in
+    // ExplorerScreen (see SavedIdsNotifier.refreshAlive).
+    final downloadProgress = ref.watch(
+      downloadProvider.select((d) => d.fileId == id ? d.progress : null),
+    );
+    final saved = ref.watch(savedIdsProvider.select((s) => s.contains(id)));
 
-    if (download.fileId == widget.file.id) {
+    if (downloadProgress != null) {
       return SizedBox(
         width: 40,
         height: 40,
@@ -68,14 +71,14 @@ class _SaveToDeviceButtonState extends ConsumerState<SaveToDeviceButton> {
             width: 22, height: 22,
             child: CircularProgressIndicator(
               strokeWidth: 2,
-              value: download.progress == 0 ? null : download.progress,
+              value: downloadProgress == 0 ? null : downloadProgress,
             ),
           ),
         ),
       );
     }
 
-    if (_saved) {
+    if (saved) {
       return SizedBox(
         width: 40,
         height: 40,
@@ -90,7 +93,7 @@ class _SaveToDeviceButtonState extends ConsumerState<SaveToDeviceButton> {
       tooltip: 'Save to device',
       onPressed: () async {
         await ref.read(downloadProvider.notifier).saveToDevice(widget.file);
-        await _refresh();
+        await _saved.recheck(widget.file);
       },
     );
   }

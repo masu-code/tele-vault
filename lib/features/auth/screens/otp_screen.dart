@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../../shell/main_shell.dart';
 import '../providers/auth_provider.dart';
 import 'twofa_screen.dart';
 
@@ -24,28 +23,33 @@ class _OtpScreenState extends ConsumerState<OtpScreen> {
   Widget build(BuildContext context) {
     final auth = ref.watch(authProvider);
 
-    ref.listen(authProvider, (_, next) {
-      if (next.step == AuthStep.waitingPassword) {
+    ref.listen(authProvider, (previous, next) {
+      // Transition-only, same reason as PhoneScreen: a failed checkPassword
+      // keeps step == waitingPassword and would otherwise stack another
+      // TwoFaScreen every time.
+      if (previous?.step != AuthStep.waitingPassword &&
+          next.step == AuthStep.waitingPassword) {
         Navigator.of(context).push(
           MaterialPageRoute(builder: (_) => const TwoFaScreen()),
         );
       } else if (next.step == AuthStep.authenticated) {
-        // No 2FA needed — signIn() alone reached authenticated. Same fix as
-        // TwoFaScreen: replace the whole pushed stack with MainShell instead
-        // of leaving this screen stuck on top forever.
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const MainShell()),
-          (route) => false,
-        );
+        // No 2FA needed — signIn() alone reached authenticated. Changing
+        // MaterialApp.home doesn't affect routes already pushed on top of it,
+        // so this screen would sit there forever over an app that's actually
+        // logged in. Popping back to the root reveals the new home, which is
+        // MainShell by now — pushing another MainShell here instead would
+        // build a second one and run its whole startup sequence twice.
+        Navigator.of(context).popUntil((route) => route.isFirst);
       }
     });
 
     return Scaffold(
       appBar: AppBar(title: const Text('Verification')),
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(32),
           child: Column(
+            mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const SizedBox(height: 24),

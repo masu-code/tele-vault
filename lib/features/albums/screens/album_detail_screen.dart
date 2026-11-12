@@ -3,10 +3,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/local_storage/local_file_service.dart';
 import '../../download/providers/download_provider.dart';
 import '../../explorer/providers/index_provider.dart';
+import '../../explorer/providers/select_helpers.dart';
 import '../../explorer/widgets/save_to_device_button.dart';
 import '../../gallery/models/gallery_entry.dart';
 import '../../gallery/widgets/gallery_tile.dart';
+import '../../gallery/widgets/scroll_idle.dart';
 import '../../preview/screens/media_viewer_screen.dart';
+import '../../../models/album.dart';
 import '../../../models/file_item.dart';
 
 /// Shows one album's media. Tap opens the viewer; long-press selects items to
@@ -26,10 +29,10 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
   bool _selecting = false;
 
   void _exitSelection() => setState(() {
-        _selecting = false;
-        _selected.clear();
-        _savedIds.clear();
-      });
+    _selecting = false;
+    _selected.clear();
+    _savedIds.clear();
+  });
 
   Future<void> _checkSaved(FileItem file) async {
     if (await LocalFileService.instance.isSaved(file)) {
@@ -59,7 +62,9 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
 
   Future<void> _removeSelected() async {
     if (_selected.isEmpty) return;
-    await ref.read(indexProvider.notifier).removeFromAlbum(widget.albumId, _selected.toList());
+    await ref
+        .read(indexProvider.notifier)
+        .removeFromAlbum(widget.albumId, _selected.toList());
     _exitSelection();
   }
 
@@ -72,27 +77,59 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final index = ref.watch(indexProvider).index;
-    final matches = index.albums.where((a) => a.id == widget.albumId);
-    if (matches.isEmpty) {
+    // Watch only this album and its visible members, not the whole index:
+    // an unrelated upload or rename must not rebuild the grid.
+    final view = ref.watch(
+      indexProvider.select((s) {
+        final index = s.index;
+        Album? album;
+        for (final a in index.albums) {
+          if (a.id == widget.albumId) {
+            album = a;
+            break;
+          }
+        }
+        if (album == null) return const _AlbumView(null, IdentityList(<FileItem>[]));
+        // Archived files stay members of the album (so unarchiving brings
+        // them right back) but don't show while archived, same as Gallery.
+        return _AlbumView(
+          album,
+          IdentityList(
+            index.filesByIds(album.fileIds).where((f) => !f.archived).toList(),
+          ),
+        );
+      }),
+    );
+    final album = view.album;
+    if (album == null) {
       return Scaffold(
         appBar: AppBar(),
-        body: const Center(child: Text('Album not found', style: TextStyle(color: Colors.white54))),
+        body: const Center(
+          child: Text(
+            'Album not found',
+            style: TextStyle(color: Colors.white54),
+          ),
+        ),
       );
     }
-    final album = matches.first;
-    final items = index.filesByIds(album.fileIds);
+    final items = view.items.items;
 
     ref.listen(downloadProvider, (prev, next) {
-      final msg = next.savedMessage ?? (next.error != null ? 'Failed: ${next.error}' : null);
-      if (msg != null && (next.savedMessage != prev?.savedMessage || next.error != prev?.error)) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+      final msg =
+          next.savedMessage ??
+          (next.error != null ? 'Failed: ${next.error}' : null);
+      if (msg != null &&
+          (next.savedMessage != prev?.savedMessage ||
+              next.error != prev?.error)) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(msg)));
       }
     });
-    ref.listen(indexProvider, (prev, next) {
-      if (next.mutationError != null && next.mutationError != prev?.mutationError) {
+    ref.listen(indexProvider.select((s) => s.mutationError), (prev, next) {
+      if (next != null && next != prev) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Action failed: ${next.mutationError}')),
+          SnackBar(content: Text('Action failed: $next')),
         );
       }
     });
@@ -103,7 +140,10 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
     return Scaffold(
       appBar: _selecting
           ? AppBar(
-              leading: IconButton(icon: const Icon(Icons.close), onPressed: _exitSelection),
+              leading: IconButton(
+                icon: const Icon(Icons.close),
+                onPressed: _exitSelection,
+              ),
               title: Text('${_selected.length} selected'),
               actions: [
                 IconButton(
@@ -118,7 +158,10 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
                 const Padding(
                   padding: EdgeInsets.symmetric(horizontal: 12),
                   child: Center(
-                    child: Icon(Icons.cloud_done_outlined, color: Color(0xFF2AABEE)),
+                    child: Icon(
+                      Icons.cloud_done_outlined,
+                      color: Color(0xFF2AABEE),
+                    ),
                   ),
                 ),
                 // Device-presence status: Download (pending) or On device (done).
@@ -126,7 +169,10 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 12),
                     child: Center(
-                      child: Icon(onDeviceIcon(), color: const Color(0xFF2AABEE)),
+                      child: Icon(
+                        onDeviceIcon(),
+                        color: const Color(0xFF2AABEE),
+                      ),
                     ),
                   )
                 else
@@ -145,38 +191,64 @@ class _AlbumDetailScreenState extends ConsumerState<AlbumDetailScreen> {
           : AppBar(title: Text(album.name)),
       body: items.isEmpty
           ? const Center(
-              child: Text('This album is empty.\nAdd photos from the Gallery.',
-                  textAlign: TextAlign.center, style: TextStyle(color: Colors.white54)),
-            )
-          : GridView.builder(
-              padding: const EdgeInsets.all(2),
-              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                maxCrossAxisExtent: 120,
-                crossAxisSpacing: 2,
-                mainAxisSpacing: 2,
+              child: Text(
+                'This album is empty.\nAdd photos from the Gallery.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white54),
               ),
-              itemCount: items.length,
-              itemBuilder: (context, i) {
-                final file = items[i];
-                return GalleryTile(
-                  key: ValueKey(file.id),
-                  entry: GalleryEntry(fileItem: file),
-                  selected: _selected.contains(file.id),
-                  onLongPress: () => _selecting ? _toggle(file) : _startSelection(file),
-                  onTap: () {
-                    if (_selecting) {
-                      _toggle(file);
-                    } else {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) => MediaViewerScreen(items: items, initialIndex: i),
-                        ),
-                      );
-                    }
-                  },
-                );
-              },
+            )
+          : ScrollIdleTracker(
+              child: GridView.builder(
+                padding: const EdgeInsets.all(2),
+                gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                  maxCrossAxisExtent: 120,
+                  crossAxisSpacing: 2,
+                  mainAxisSpacing: 2,
+                ),
+                itemCount: items.length,
+                itemBuilder: (context, i) {
+                  final file = items[i];
+                  return GalleryTile(
+                    key: ValueKey(file.id),
+                    entry: GalleryEntry(fileItem: file),
+                    selected: _selected.contains(file.id),
+                    onLongPress: () =>
+                        _selecting ? _toggle(file) : _startSelection(file),
+                    onTap: () {
+                      if (_selecting) {
+                        _toggle(file);
+                      } else {
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) => MediaViewerScreen(
+                              items: items,
+                              initialIndex: i,
+                            ),
+                          ),
+                        );
+                      }
+                    },
+                  );
+                },
+              ),
             ),
     );
   }
+}
+
+/// What the album screen renders: the album record and its visible files.
+class _AlbumView {
+  const _AlbumView(this.album, this.items);
+
+  final Album? album;
+  final IdentityList<FileItem> items;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _AlbumView &&
+      identical(other.album, album) &&
+      other.items == items;
+
+  @override
+  int get hashCode => Object.hash(album, items);
 }

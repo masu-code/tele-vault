@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TeleVault - Your gallery, stored in your own Telegram</title>
+<meta name="description" content="TeleVault is a gallery and file manager for Android that uses your own Telegram Saved Messages as cloud storage. No server, no subscription, bring your own API credentials.">
+<meta name="theme-color" content="#1C1C1E">
+<link rel="icon" type="image/png" sizes="64x64" href="favicon.png">
+<link rel="apple-touch-icon" href="icon.png">
+<style>
+:root {
+  --primary: #2AABEE;
+  --primary-ink: #04202f;
+  --bg: #121214;
+  --surface: #1C1C1E;
+  --surface-2: #26262a;
+  --border: #34343a;
+  --text: #f2f2f4;
+  --muted: #a1a1aa;
+  --radius: 16px;
+  --max: 1080px;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--primary); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.wrap { max-width: var(--max); margin: 0 auto; padding: 0 20px; }
+header.nav { display: flex; align-items: center; justify-content: space-between; padding: 18px 0; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; color: var(--text); }
+.brand:hover { text-decoration: none; }
+.logo { width: 32px; height: 32px; border-radius: 7px; display: block; }
+.hero-icon {
+  width: 112px; height: 112px; border-radius: 25px; display: block; margin: 0 auto 24px;
+  box-shadow: 0 10px 40px rgba(42, 171, 238, .25);
+}
+nav.links { display: flex; gap: 18px; font-size: 15px; }
+nav.links a { color: var(--muted); }
+nav.links a:hover { color: var(--text); text-decoration: none; }
+
+.hero { text-align: center; padding: 64px 0 48px; }
+.hero h1 { font-size: clamp(34px, 6vw, 58px); line-height: 1.1; margin: 0 0 18px; letter-spacing: -0.02em; }
+.hero h1 span { color: var(--primary); }
+.hero p.lead { max-width: 640px; margin: 0 auto 30px; color: var(--muted); font-size: clamp(16px, 2.2vw, 19px); }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 13px 22px; border-radius: 999px; font-weight: 600; font-size: 16px;
+  border: 1px solid transparent; transition: transform .12s ease, background .12s ease;
+}
+.btn:hover { text-decoration: none; transform: translateY(-1px); }
+.btn svg { width: 18px; height: 18px; flex: none; }
+.btn.primary { background: var(--primary); color: var(--primary-ink); }
+.btn.primary:hover { background: #4cbcf5; }
+.btn.ghost { background: transparent; color: var(--text); border-color: var(--border); }
+.btn.ghost:hover { background: var(--surface); }
+.hint { margin-top: 14px; font-size: 14px; color: var(--muted); }
+
+section { padding: 48px 0; }
+section h2 { font-size: clamp(24px, 4vw, 34px); margin: 0 0 8px; letter-spacing: -0.01em; }
+section p.sub { margin: 0 0 28px; color: var(--muted); max-width: 640px; }
+
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 22px;
+}
+.card .icon {
+  width: 40px; height: 40px; border-radius: 12px; margin-bottom: 14px;
+  background: rgba(42, 171, 238, .14); color: var(--primary);
+  display: grid; place-items: center;
+}
+.card .icon svg { width: 22px; height: 22px; }
+.card h3 { margin: 0 0 6px; font-size: 17px; }
+.card p { margin: 0; color: var(--muted); font-size: 15px; }
+
+.shots { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+.shot {
+  aspect-ratio: 9 / 19; border-radius: 22px; background: var(--surface);
+  border: 1px dashed var(--border); display: grid; place-items: center; text-align: center;
+  color: var(--muted); font-size: 14px; padding: 16px; overflow: hidden;
+}
+.shot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.shot small { display: block; margin-top: 4px; opacity: .7; }
+/* TODO: replace each placeholder .shot content with
+   <img src="screenshots/NAME.png" alt="..." loading="lazy"> once the screenshots exist. */
+
+.note {
+  background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--primary);
+  border-radius: var(--radius); padding: 24px;
+}
+.note h2 { font-size: 22px; }
+.note ul { margin: 12px 0 0; padding-left: 20px; color: var(--muted); }
+.note li { margin: 6px 0; }
+.note li strong { color: var(--text); }
+
+.steps { counter-reset: step; display: grid; gap: 12px; padding: 0; margin: 0; list-style: none; }
+.steps li {
+  counter-increment: step; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px 18px 16px 58px; position: relative; color: var(--muted);
+}
+.steps li::before {
+  content: counter(step); position: absolute; left: 16px; top: 14px; width: 30px; height: 30px;
+  border-radius: 50%; background: var(--primary); color: var(--primary-ink);
+  display: grid; place-items: center; font-weight: 700;
+}
+.steps li strong { color: var(--text); }
+
+footer { border-top: 1px solid var(--border); margin-top: 32px; padding: 28px 0 40px; color: var(--muted); font-size: 14px; }
+footer .row { display: flex; flex-wrap: wrap; gap: 12px 24px; justify-content: space-between; }
+footer .links { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+footer p { margin: 14px 0 0; max-width: 760px; }
+
+@media (max-width: 560px) {
+  .hero { padding: 40px 0 32px; }
+  nav.links a:not(.keep) { display: none; }
+  .btn { width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .btn { transition: none; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="nav">
+    <a class="brand" href="#top">
+      <img class="logo" src="logo.svg" width="32" height="32" alt="">
+      TeleVault
+    </a>
+    <nav class="links" aria-label="Primary">
+      <a href="#features">Features</a>
+      <a href="#setup">Setup</a>
+      <a href="#privacy">Privacy</a>
+      <a class="keep" href="https://github.com/masu-code/tele-vault">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <div class="hero">
+      <img class="hero-icon" src="logo.svg" width="112" height="112" alt="TeleVault app icon">
+      <h1>Your gallery, stored in <span>your own Telegram</span></h1>
+      <p class="lead">A fast photo and file manager for Android that backs up to your Telegram Saved Messages. No server, no subscription, nothing shipped with credentials. Your account, your storage.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/masu-code/tele-vault/releases/latest">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M4 20h16"/></svg>
+          Download the APK
+        </a>
+        <a class="btn ghost" href="https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/masu-code/tele-vault">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7M21 4v5h-5"/></svg>
+          Add to Obtainium
+        </a>
+      </div>
+      <p class="hint">Android. Updates through Obtainium or by downloading the next release.</p>
+    </div>
+
+    <section id="features">
+      <h2>Built to feel like a photo app</h2>
+      <p class="sub">One timeline for the phone and the cloud, with backup that runs on its own.</p>
+      <div class="grid">
+        <article class="card">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></div>
+          <h3>Unified gallery</h3>
+          <p>Device and cloud together, grouped by month, with instant previews and no grey tiles while you scroll.</p>
+        </article>
+        <article class="card">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.5 19a4.5 4.5 0 0 0 .6-8.96A6 6 0 0 0 6.4 8.6 4.8 4.8 0 0 0 7 19z"/><path d="M12 16v-5m0 0-2 2m2-2 2 2"/></svg></div>
+          <h3>Background backup</h3>
+          <p>Photos and albums upload automatically, even with the app closed, with a progress notification and a Wi-Fi or mobile data gate.</p>
+        </article>
+        <article class="card">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M4 16V6a2 2 0 0 1 2-2h10"/></svg></div>
+          <h3>Deduplication</h3>
+          <p>Uploads are matched against the cloud index, so reinstalling never re-uploads what is already stored.</p>
+        </article>
+        <article class="card">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg></div>
+          <h3>Index that survives</h3>
+          <p>The index lives in your Telegram, so it comes back after a reinstall and follows you across devices.</p>
+        </article>
+        <article class="card">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m13 2-9 12h7l-1 8 9-12h-7z"/></svg></div>
+          <h3>Native crypto</h3>
+          <p>AES runs natively through FFI on ARMv8 Crypto Extensions or AES-NI, hundreds of times faster than pure Dart.</p>
+        </article>
+        <article class="card">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/></svg></div>
+          <h3>Video player</h3>
+          <p>Tap-to-seek, fullscreen and hardware decoding, right inside the viewer.</p>
+        </article>
+        <article class="card">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+          <h3>Albums, archive, free up space</h3>
+          <p>Organize into albums, archive items, and reclaim phone storage for files confirmed in the cloud.</p>
+        </article>
+        <article class="card">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="1.5"/><path d="m21 15-5-5L5 21"/></svg></div>
+          <h3>Thumbnail packs</h3>
+          <p>Compact preview packs and an in-app backfill build thumbnails for files already in your cloud.</p>
+        </article>
+        <article class="card">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 9.2-9.2M16 7l3 3M14 9l2 2"/></svg></div>
+          <h3>Your own API keys</h3>
+          <p>Each user enters their own api_id and api_hash from my.telegram.org. No credentials ship with the app.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="screenshots">
+      <h2>Screenshots</h2>
+      <p class="sub">Taken from a synthetic gallery, never from a real library.</p>
+      <div class="shots">
+        <!-- TODO: docs/screenshots/gallery.png -->
+        <figure class="shot" style="margin:0"><div>Gallery<small>docs/screenshots/gallery.png</small></div></figure>
+        <!-- TODO: docs/screenshots/viewer.png -->
+        <figure class="shot" style="margin:0"><div>Viewer<small>docs/screenshots/viewer.png</small></div></figure>
+        <!-- TODO: docs/screenshots/albums.png -->
+        <figure class="shot" style="margin:0"><div>Albums<small>docs/screenshots/albums.png</small></div></figure>
+        <!-- TODO: docs/screenshots/backup.png -->
+        <figure class="shot" style="margin:0"><div>Backup<small>docs/screenshots/backup.png</small></div></figure>
+      </div>
+    </section>
+
+    <section id="setup">
+      <h2>Get started in a few minutes</h2>
+      <p class="sub">You need a free Telegram application identity. It takes a minute.</p>
+      <ol class="steps">
+        <li><strong>Install.</strong> Download the APK from the latest release, or add the repository to Obtainium.</li>
+        <li><strong>Get your API credentials.</strong> Log in at <a href="https://my.telegram.org">my.telegram.org</a>, open API development tools, and create an app. Avoid the word "telegram" in the title and turn off any VPN.</li>
+        <li><strong>Sign in.</strong> Paste the api_id and api_hash into TeleVault, then log in with your phone number, the code Telegram sends, and your 2FA password if you use one.</li>
+      </ol>
+    </section>
+
+    <section id="privacy">
+      <div class="note">
+        <h2>Privacy, honestly</h2>
+        <ul>
+          <li><strong>Your files stay in your own Telegram account.</strong> TeleVault has no server, no analytics and no accounts.</li>
+          <li><strong>Transport is MTProto,</strong> from your device straight to Telegram.</li>
+          <li><strong>Saved Messages are not end-to-end encrypted.</strong> Telegram can technically read what you store in cloud chats. Do not store anything you would not trust Telegram with.</li>
+          <li><strong>Open source, MIT licensed.</strong> Read the code, build it yourself, and verify release checksums.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="row">
+      <div>TeleVault &middot; MIT License &middot; &copy; 2026 Samuel Contreras</div>
+      <div class="links">
+        <a href="https://github.com/masu-code/tele-vault">GitHub</a>
+        <a href="https://github.com/masu-code/tele-vault/releases/latest">Releases</a>
+        <a href="https://github.com/masu-code/tele-vault/blob/main/CHANGELOG.md">Changelog</a>
+        <a href="https://github.com/masu-code/tele-vault/issues">Issues</a>
+      </div>
+    </div>
+    <p>TeleVault is an independent project and is not affiliated with, endorsed by, or sponsored by Telegram. "Telegram" is a trademark of its respective owner.</p>
+  </footer>
+</div>
+</body>
+</html>

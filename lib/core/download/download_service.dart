@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:t/t.dart' as t;
@@ -8,6 +9,7 @@ import '../backup/backup_registry.dart';
 import '../telegram/client.dart';
 import '../telegram/tg_utils.dart';
 import 'download_plan.dart';
+import 'download_worker.dart';
 
 /// Downloads a [FileItem] from Telegram, reassembling its segments (parts) into
 /// a single local file in order.
@@ -18,13 +20,33 @@ class DownloadService {
   /// Downloads [item] into [destDir] and returns the written file. Parts are
   /// fetched and appended in order, so the output is the original file even
   /// when it was split across multiple Telegram documents.
+  ///
+  /// On the app's main isolate this runs on [DownloadWorker] so the AES
+  /// decryption of every chunk stays off the UI thread.
   Future<File> downloadFile(
     FileItem item, {
     required String destDir,
     void Function(double progress)? onProgress,
   }) async {
+    if (DownloadWorker.enabled) {
+      return File(await DownloadWorker.instance
+          .downloadFile(item, destDir: destDir, onProgress: onProgress));
+    }
+    return _downloadFile(item, destDir: destDir, onProgress: onProgress);
+  }
+
+  Future<File> _downloadFile(
+    FileItem item, {
+    required String destDir,
+    void Function(double progress)? onProgress,
+  }) async {
     final out = File(p.join(destDir, item.name));
-    final sink = await out.open(mode: FileMode.write);
+    // Written to a unique temp file and renamed into place on success: a retry
+    // after the inactivity timeout can run a second download of the same file
+    // while the first is still alive, and a shared output path let the first
+    // one's failure delete the file the second was writing.
+    final tmp = File('${out.path}.${_randomSuffix()}.part');
+    final sink = await tmp.open(mode: FileMode.write);
     var written = 0;
 
     try {
@@ -58,12 +80,24 @@ class DownloadService {
       // failed in the middle while later ranges still got written, pushing
       // the file's length past the hole) would otherwise be silently served
       // as "complete" forever on every future retry.
-      if (await out.exists()) await out.delete();
+      // Only our own temp file: a concurrent download owns a different one.
+      if (await tmp.exists()) await tmp.delete();
       rethrow;
     }
-    await sink.close();
+    try {
+      await sink.close();
+      await tmp.rename(out.path);
+    } catch (e) {
+      if (await tmp.exists()) await tmp.delete();
+      rethrow;
+    }
     return out;
   }
+
+  static final _rng = Random();
+  static String _randomSuffix() =>
+      '${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}'
+      '${_rng.nextInt(1 << 32).toRadixString(36)}';
 
   /// Fetches [size] bytes at [location] as several 1 MB windows in parallel
   /// (bounded concurrency) and writes each to [sink] at [baseOffset] + its
@@ -154,16 +188,80 @@ class DownloadService {
   Future<File> downloadToCache(
     FileItem item, {
     void Function(double progress)? onProgress,
-  }) async {
+  }) {
+    // One download per file at a time: the viewer's neighbour pages and the
+    // precacher can ask for the same photo at once, and each used to start its
+    // own 4-window download of it. Kept here on the calling isolate, so the
+    // worker never receives two requests for one file. Later callers wait on
+    // the first; their progress callback is dropped.
+    //
+    // The entry is removed when the future completes with a value or an error,
+    // and every path below completes: the worker request fails with
+    // DownloadException('timeout') after DownloadWorker.defaultInactivityTimeout
+    // without progress, the inline path is guarded the same way, so a dead
+    // connection can't leave a stale future here that every later caller joins.
+    final running = _inFlightCache[item.id];
+    if (running != null) return running;
+    final future = _downloadToCache(item, onProgress: onProgress);
+    _inFlightCache[item.id] = future;
+    future.whenComplete(() {
+      if (identical(_inFlightCache[item.id], future)) _inFlightCache.remove(item.id);
+    }).ignore();
+    return future;
+  }
+
+  final Map<String, Future<File>> _inFlightCache = {};
+
+  /// The already-available copy of [item] (device original or complete cache
+  /// file), or null — never starts a download.
+  Future<File?> cachedFileFor(FileItem item) async {
     final linked = BackupRegistry.instance.localPathFor(item.id);
     if (linked != null) {
       final local = File(linked);
-      if (await local.exists()) {
-        onProgress?.call(1);
-        return local;
-      }
+      if (await local.exists()) return local;
     }
+    final tmp = await getTemporaryDirectory();
+    final cached = File(p.join(tmp.path, 'televault_cache', item.id, item.name));
+    if (await cached.exists() && await cached.length() == item.totalSize) return cached;
+    return null;
+  }
 
+  Future<File> _downloadToCache(
+    FileItem item, {
+    void Function(double progress)? onProgress,
+  }) async {
+    // Checked here, not in the worker: the device-original link lives in
+    // BackupRegistry, which only this isolate has loaded and keeps current.
+    final ready = await cachedFileFor(item);
+    if (ready != null) {
+      onProgress?.call(1);
+      return ready;
+    }
+    if (DownloadWorker.enabled) {
+      return File(
+          await DownloadWorker.instance.downloadToCache(item, onProgress: onProgress));
+    }
+    // Inline (headless engine, desktop): no worker timeout applies here, so
+    // guard it the same way. Progress per chunk keeps a healthy download alive.
+    return withInactivityTimeout<File>(
+      DownloadWorker.defaultInactivityTimeout,
+      (touch) => downloadIntoCache(item, onProgress: (p) {
+        touch();
+        onProgress?.call(p);
+      }),
+    );
+  }
+
+  /// Downloads [item] into the preview cache folder
+  /// (`<temp>/televault_cache/<id>/<name>`), reusing a complete copy already
+  /// there. Always downloads on the current isolate — this is what
+  /// [DownloadWorker] runs — and skips the device-original check, since
+  /// BackupRegistry isn't loaded on the worker isolate; callers go through
+  /// [downloadToCache], which does that check first.
+  Future<File> downloadIntoCache(
+    FileItem item, {
+    void Function(double progress)? onProgress,
+  }) async {
     final tmp = await getTemporaryDirectory();
     final dir = Directory(p.join(tmp.path, 'televault_cache', item.id));
     await dir.create(recursive: true);
@@ -173,7 +271,7 @@ class DownloadService {
       onProgress?.call(1);
       return cached;
     }
-    return downloadFile(item, destDir: dir.path, onProgress: onProgress);
+    return _downloadFile(item, destDir: dir.path, onProgress: onProgress);
   }
 
   /// Fetches the [t.Document] backing a stored part by its message id. The

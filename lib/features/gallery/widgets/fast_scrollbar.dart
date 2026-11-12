@@ -41,13 +41,29 @@ class _FastScrollbarState extends State<FastScrollbar> {
   static const double _thumbWidth = 44;
   static const Duration _fadeAfter = Duration(milliseconds: 1200);
 
-  double _fraction = 0;
-  bool _dragging = false;
-  bool _visible = false;
+  // Scroll-driven state lives in ValueNotifiers, not setState — a fling
+  // fires the scroll listener every frame, and setState here used to rerun
+  // the LayoutBuilder below, forcing a full relayout of widget.child (the
+  // entire grid) on every one of those frames. That's the actual cause of
+  // the stutter/teleporting during a fast fling: real work competing with
+  // Flutter's own scroll physics for the same frame budget, on top of
+  // whatever the fling was already doing. A ValueListenableBuilder scoped to
+  // just the thumb rebuilds only that small overlay, leaving the grid's own
+  // layout completely undisturbed by the scroll position ticking.
+  final ValueNotifier<double> _fraction = ValueNotifier(0);
+  final ValueNotifier<bool> _visible = ValueNotifier(false);
+  final ValueNotifier<bool> _dragging = ValueNotifier(false);
+  late final Listenable _thumbListenable = Listenable.merge([
+    _fraction,
+    _visible,
+    _dragging,
+  ]);
   Timer? _hideTimer;
 
-  /// Track geometry captured on the last build — drag math needs it and the
-  /// gesture callbacks run outside the LayoutBuilder.
+  /// Track geometry captured on the last layout — drag math needs it and the
+  /// gesture callbacks run outside the LayoutBuilder. Only changes when this
+  /// widget's own size does (rotation/window resize), since nothing here
+  /// calls setState on scroll/drag anymore.
   double _trackExtent = 0;
 
   @override
@@ -69,55 +85,74 @@ class _FastScrollbarState extends State<FastScrollbar> {
   void dispose() {
     _hideTimer?.cancel();
     widget.controller.removeListener(_onScroll);
+    _fraction.dispose();
+    _visible.dispose();
+    _dragging.dispose();
     super.dispose();
   }
 
+  /// True once [position] has an established viewport/content size to
+  /// measure against. `ScrollPosition.maxScrollExtent` asserts on this
+  /// internally in debug mode but null-checks a not-yet-set private field
+  /// in release/profile — accessing it beforehand (e.g. right as a
+  /// scrollable is first inserted, before its first layout) crashes with
+  /// "Null check operator used on a null value" instead of the assert's
+  /// friendlier message. `hasClients`/`positions.length == 1` alone don't
+  /// cover this: a position can have a client attached before it's been
+  /// through a layout pass.
+  bool _hasMeasuredExtent(ScrollPosition position) =>
+      position.hasContentDimensions;
+
   void _onScroll() {
-    if (_dragging) return; // the drag itself drives the position
+    if (_dragging.value) return; // the drag itself drives the position
     final position = widget.controller.positions.length == 1
         ? widget.controller.position
         : null;
-    if (position == null || position.maxScrollExtent <= 0) return;
-    setState(() {
-      _fraction = (position.pixels / position.maxScrollExtent).clamp(0.0, 1.0);
-      _visible = true;
-    });
+    if (position == null ||
+        !_hasMeasuredExtent(position) ||
+        position.maxScrollExtent <= 0) {
+      return;
+    }
+    _fraction.value = (position.pixels / position.maxScrollExtent).clamp(
+      0.0,
+      1.0,
+    );
+    _visible.value = true;
     _scheduleHide();
   }
 
   void _scheduleHide() {
     _hideTimer?.cancel();
     _hideTimer = Timer(_fadeAfter, () {
-      if (mounted && !_dragging) setState(() => _visible = false);
+      if (mounted && !_dragging.value) _visible.value = false;
     });
   }
 
   void _jumpTo(double fraction) {
     if (widget.controller.positions.length != 1) return;
     final position = widget.controller.position;
-    if (position.maxScrollExtent <= 0) return;
+    if (!_hasMeasuredExtent(position) || position.maxScrollExtent <= 0) return;
     position.jumpTo(fraction * position.maxScrollExtent);
   }
 
   void _onDragStart(DragStartDetails _) {
     _hideTimer?.cancel();
-    setState(() {
-      _dragging = true;
-      _visible = true;
-    });
+    _dragging.value = true;
+    _visible.value = true;
   }
 
   void _onDragUpdate(DragUpdateDetails details) {
     final travel = _trackExtent - _thumbHeight;
     if (travel <= 0) return;
-    setState(() {
-      _fraction = (_fraction + details.delta.dy / travel).clamp(0.0, 1.0);
-    });
-    _jumpTo(_fraction);
+    _fraction.value = (_fraction.value + details.delta.dy / travel).clamp(
+      0.0,
+      1.0,
+    );
+    _jumpTo(_fraction.value);
   }
 
   void _onDragEnd(DragEndDetails _) {
-    setState(() => _dragging = false);
+    _dragging.value = false;
     _scheduleHide();
   }
 
@@ -125,43 +160,56 @@ class _FastScrollbarState extends State<FastScrollbar> {
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        _trackExtent = constraints.maxHeight - widget.topInset - widget.bottomInset;
+        _trackExtent =
+            constraints.maxHeight - widget.topInset - widget.bottomInset;
         final travel = _trackExtent - _thumbHeight;
-        final canScroll = widget.controller.hasClients &&
-            widget.controller.positions.length == 1 &&
-            widget.controller.position.maxScrollExtent > 0;
-        final label = _dragging ? widget.labelForFraction?.call(_fraction) : null;
 
         return Stack(
           children: [
             widget.child,
-            if (canScroll && travel > 0)
-              Positioned(
-                top: widget.topInset + _fraction * travel,
-                right: 0,
-                child: AnimatedOpacity(
-                  opacity: _visible ? 1 : 0,
-                  duration: const Duration(milliseconds: 200),
-                  // Untargetable while faded out, so an invisible handle can't
-                  // swallow taps meant for the photo underneath it.
-                  child: IgnorePointer(
-                    ignoring: !_visible,
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [
-                        if (label != null) _DateBubble(text: label),
-                        GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onVerticalDragStart: _onDragStart,
-                          onVerticalDragUpdate: _onDragUpdate,
-                          onVerticalDragEnd: _onDragEnd,
-                          child: _Thumb(active: _dragging),
+            if (travel > 0)
+              ListenableBuilder(
+                listenable: _thumbListenable,
+                builder: (context, _) {
+                  final canScroll =
+                      widget.controller.hasClients &&
+                      widget.controller.positions.length == 1 &&
+                      _hasMeasuredExtent(widget.controller.position) &&
+                      widget.controller.position.maxScrollExtent > 0;
+                  if (!canScroll) return const SizedBox.shrink();
+                  final dragging = _dragging.value;
+                  final label = dragging
+                      ? widget.labelForFraction?.call(_fraction.value)
+                      : null;
+
+                  return Positioned(
+                    top: widget.topInset + _fraction.value * travel,
+                    right: 0,
+                    child: AnimatedOpacity(
+                      opacity: _visible.value ? 1 : 0,
+                      duration: const Duration(milliseconds: 200),
+                      // Untargetable while faded out, so an invisible handle
+                      // can't swallow taps meant for the photo underneath it.
+                      child: IgnorePointer(
+                        ignoring: !_visible.value,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: [
+                            if (label != null) _DateBubble(text: label),
+                            GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onVerticalDragStart: _onDragStart,
+                              onVerticalDragUpdate: _onDragUpdate,
+                              onVerticalDragEnd: _onDragEnd,
+                              child: _Thumb(active: dragging),
+                            ),
+                          ],
                         ),
-                      ],
+                      ),
                     ),
-                  ),
-                ),
+                  );
+                },
               ),
           ],
         );
@@ -182,7 +230,9 @@ class _Thumb extends StatelessWidget {
       margin: const EdgeInsets.only(right: 6),
       decoration: BoxDecoration(
         color: active ? const Color(0xFF4A4A4E) : const Color(0xCC38383C),
-        borderRadius: BorderRadius.circular(_FastScrollbarState._thumbWidth / 2),
+        borderRadius: BorderRadius.circular(
+          _FastScrollbarState._thumbWidth / 2,
+        ),
         boxShadow: const [
           BoxShadow(color: Colors.black38, blurRadius: 6, offset: Offset(0, 2)),
         ],

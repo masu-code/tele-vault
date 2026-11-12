@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tele_vault/features/gallery/models/gallery_entry.dart';
 import 'package:tele_vault/models/file_item.dart';
@@ -59,11 +60,57 @@ void main() {
     });
   });
 
+  group('duplicate month guard', () {
+    test('a month that reappears joins its existing group, with one TVDIAG',
+        () {
+      final oct1 = GalleryEntry(fileItem: _file('a', DateTime(2026, 10, 20)));
+      final sep = GalleryEntry(fileItem: _file('b', DateTime(2026, 9, 5)));
+      final oct2 = GalleryEntry(fileItem: _file('c', DateTime(2026, 10, 2)));
+      final oct3 = GalleryEntry(fileItem: _file('d', DateTime(2026, 10, 1)));
+      final logs = <String>[];
+      final prev = debugPrint;
+      debugPrint = (String? m, {int? wrapWidth}) => logs.add(m ?? '');
+      addTearDown(() => debugPrint = prev);
+
+      // Deliberately NOT sorted by date: october comes back after september.
+      final groups = groupEntriesByMonth([oct1, sep, oct2, oct3]);
+
+      expect(groups, hasLength(2));
+      expect(groups[0].month, DateTime(2026, 10));
+      expect(groups[0].entries, [oct1, oct2, oct3]);
+      expect(groups[1].month, DateTime(2026, 9));
+      expect(groups[1].entries, [sep]);
+      expect(
+        logs.where((l) => l.startsWith('TVDIAG: gallery duplicate month group')),
+        hasLength(1),
+      );
+    });
+
+    test('sorted input logs nothing', () {
+      final logs = <String>[];
+      final prev = debugPrint;
+      debugPrint = (String? m, {int? wrapWidth}) => logs.add(m ?? '');
+      addTearDown(() => debugPrint = prev);
+      groupEntriesByMonth([
+        GalleryEntry(fileItem: _file('a', DateTime(2026, 10, 20))),
+        GalleryEntry(fileItem: _file('b', DateTime(2026, 9, 5))),
+      ]);
+      expect(logs.where((l) => l.contains('TVDIAG')), isEmpty);
+    });
+  });
+
   group('monthLabel', () {
     test('formats month and year in English', () {
       expect(monthLabel(DateTime(2026, 10)), 'October 2026');
       expect(monthLabel(DateTime(2025, 1)), 'January 2025');
       expect(monthLabel(DateTime(2025, 12)), 'December 2025');
+    });
+  });
+
+  group('monthHeaderLabel', () {
+    test('omits the year only for the current year', () {
+      expect(monthHeaderLabel(DateTime(2026, 11), 2026), 'November');
+      expect(monthHeaderLabel(DateTime(2025, 6), 2026), 'June 2025');
     });
   });
 }

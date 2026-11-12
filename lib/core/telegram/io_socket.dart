@@ -21,8 +21,15 @@ import 'package:tg/tg.dart' as tg;
 ///    confusing dart:io StateError.
 class IoSocket extends tg.SocketAbstraction {
   IoSocket(this._socket) {
+    // Small RPC frames (acks, getFile requests) must not sit in Nagle's buffer.
+    try {
+      _socket.setOption(SocketOption.tcpNoDelay, true);
+    } catch (_) {}
     _socket.listen(
-      _controller.add,
+      (data) {
+        lastReceive = DateTime.now();
+        _controller.add(data);
+      },
       onError: (Object e, StackTrace st) {
         // Mark dead but do NOT forward the error: tg.Client's stream listener
         // has no onError handler, so forwarding would cause an Unhandled
@@ -52,7 +59,48 @@ class IoSocket extends tg.SocketAbstraction {
 
   bool get isDead => _dead;
 
-  void _markDead() => _dead = true;
+  final _done = Completer<void>();
+
+  /// Completes (never with an error) the moment the socket is marked dead, so
+  /// in-flight RPCs can race against it and fail immediately instead of
+  /// waiting out their own timeout.
+  Future<void> get done => _done.future;
+
+  /// Last time any bytes arrived from the server. Used by
+  /// [TelegramService.call] to decide whether the connection needs a probe.
+  DateTime lastReceive = DateTime.now();
+
+  final _onDead = <void Function()>{};
+
+  /// Registers [callback] to run once when the socket dies (immediately if it
+  /// already has). Unlike listening on [done], a callback can be removed with
+  /// [removeOnDead], so per-RPC watchers don't pile up (and keep every RPC
+  /// result reachable) for the life of the connection.
+  void addOnDead(void Function() callback) {
+    if (_dead) {
+      callback();
+      return;
+    }
+    _onDead.add(callback);
+  }
+
+  void removeOnDead(void Function() callback) => _onDead.remove(callback);
+
+  /// Number of registered on-dead callbacks (diagnostics / tests).
+  int get onDeadCount => _onDead.length;
+
+  void _markDead() {
+    _dead = true;
+    if (!_done.isCompleted) _done.complete();
+    if (_onDead.isEmpty) return;
+    final callbacks = _onDead.toList();
+    _onDead.clear();
+    for (final cb in callbacks) {
+      try {
+        cb();
+      } catch (_) {}
+    }
+  }
 
   @override
   Stream<Uint8List> get receiver => _controller.stream;

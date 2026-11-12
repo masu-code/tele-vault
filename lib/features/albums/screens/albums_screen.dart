@@ -3,11 +3,13 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:photo_manager/photo_manager.dart';
+import '../../../core/diag/tv_stats.dart';
 import '../../../core/thumbnail/thumbnail_service.dart';
 import '../../../models/album.dart';
 import '../../../models/file_item.dart';
 import '../../backup/providers/backup_provider.dart';
 import '../../explorer/providers/index_provider.dart';
+import '../providers/vault_album_summaries.dart';
 import '../../profile/widgets/floating_profile_header.dart';
 import '../../shell/scroll_to_top.dart';
 import 'album_detail_screen.dart';
@@ -164,13 +166,16 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    TvStats.screenBuild('albums');
     ref.listen(scrollToTopProvider, (prev, next) {
       if (next != null && next.tabIndex == 1) _scrollToTop();
     });
-    final indexState = ref.watch(indexProvider);
-    final backup = ref.watch(backupProvider);
-    final vaultAlbums = indexState.index.albums;
-    final deviceAlbums = backup.deviceAlbums;
+    // Narrow watches: this tab is kept alive in the IndexedStack, so watching
+    // whole providers rebuilt it on every upload/progress tick.
+    final vaultAlbums = ref.watch(vaultAlbumSummariesProvider).items;
+    final deviceAlbums = ref.watch(backupProvider.select((s) => s.deviceAlbums));
+    final enabledIds = ref.watch(backupProvider.select((s) => s.enabledIds));
+    final refreshTick = ref.watch(backupProvider.select((s) => s.refreshTick));
 
     final totalCount = vaultAlbums.length + deviceAlbums.length;
 
@@ -208,12 +213,11 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
                 // Device albums come first.
                 if (i < deviceAlbums.length) {
                   final album = deviceAlbums[i];
-                  final isEnabled = backup.isEnabled(album.id);
                   return _DeviceAlbumCard(
                     key: ValueKey('device_${album.id}'),
                     album: album,
-                    hasCloud: isEnabled,
-                    refreshTick: backup.refreshTick,
+                    hasCloud: enabledIds.contains(album.id),
+                    refreshTick: refreshTick,
                     onTap: () => Navigator.of(context).push(MaterialPageRoute(
                       builder: (_) => DeviceAlbumDetailScreen(album: album),
                     )),
@@ -221,14 +225,13 @@ class _AlbumsScreenState extends ConsumerState<AlbumsScreen> {
                   );
                 }
                 // Vault albums follow.
-                final album = vaultAlbums[i - deviceAlbums.length];
-                final items = indexState.index.filesByIds(album.fileIds);
-                final cover = items.isNotEmpty ? items.first : null;
+                final summary = vaultAlbums[i - deviceAlbums.length];
+                final album = summary.album;
                 return _VaultAlbumCard(
                   key: ValueKey('vault_${album.id}'),
                   album: album,
-                  itemCount: items.length,
-                  cover: cover,
+                  itemCount: summary.itemCount,
+                  cover: summary.cover,
                   onTap: () => Navigator.of(context).push(MaterialPageRoute(
                     builder: (_) => AlbumDetailScreen(albumId: album.id),
                   )),
@@ -492,7 +495,7 @@ class _DeviceCoverState extends State<_DeviceCover> {
   void didUpdateWidget(_DeviceCover oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.asset.id != widget.asset.id) {
-      setState(() => _thumb = const <int>[]);
+      setState(() => _thumb = null);
       _load();
     }
   }
@@ -507,14 +510,21 @@ class _DeviceCoverState extends State<_DeviceCover> {
     });
   }
 
-  var _thumb = const <int>[];
+  Uint8List? _thumb;
 
   @override
   Widget build(BuildContext context) {
-    if (_thumb.isEmpty) return Container(color: const Color(0xFF1C1C1E));
+    final bytes = _thumb;
+    if (bytes == null || bytes.isEmpty) {
+      return Container(color: const Color(0xFF1C1C1E));
+    }
+    // The same Uint8List instance on every build, so the image cache key is
+    // stable and the cover isn't re-decoded when the card rebuilds.
     return Image.memory(
-      Uint8List.fromList(_thumb),
+      bytes,
       fit: BoxFit.cover,
+      cacheWidth: 300,
+      gaplessPlayback: true,
       errorBuilder: (_, _, _) => Container(color: const Color(0xFF1C1C1E)),
     );
   }

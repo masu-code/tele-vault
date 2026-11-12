@@ -1,4 +1,5 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <!-- Internet access for Telegram MTProto -->
     <uses-permission android:name="android.permission.INTERNET"/>
 
@@ -11,7 +12,7 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
 
     <!-- Foreground service (flutter_background): lets bulk uploads/downloads
-         keep running — and keep their network access — while the app is
+         keep running â€” and keep their network access â€” while the app is
          backgrounded (screen off, another app in front), instead of Android
          cutting the connection mid-transfer. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
@@ -19,13 +20,26 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
 
     <application
-        android:label="tele_vault"
+        android:label="TeleVault"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <service
             android:name="de.julianassmann.flutter_background.IsolateHolderService"
             android:exported="false"
             android:foregroundServiceType="dataSync"/>
+        <!-- WorkManager's foreground service: the headless backup task runs
+             as a dataSync foreground service (headless_sync.dart,
+             headlessForegroundConfig). workmanager_android declares only
+             shortService unless the gradle property
+             workmanager.enableDataSyncForegroundService=true is set; this
+             override adds dataSync (FOREGROUND_SERVICE_DATA_SYNC is declared
+             above). Without it Android 14+ rejects the dataSync start. -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync|shortService"
+            tools:node="merge"
+            tools:replace="android:foregroundServiceType"
+            tools:targetApi="34"/>
         <activity
             android:name=".MainActivity"
             android:exported="true"

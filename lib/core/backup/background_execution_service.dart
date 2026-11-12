@@ -46,6 +46,8 @@ class BackgroundExecutionService {
         androidConfig: const FlutterBackgroundAndroidConfig(
           notificationTitle: 'TeleVault',
           notificationText: 'Syncing your photos and videos…',
+          // flutter_background doesn't support Low/Min (see its issue #37), so
+          // this stays Normal; the progress bar is TransferNotifications'.
           notificationImportance: AndroidNotificationImportance.normal,
         ),
       );

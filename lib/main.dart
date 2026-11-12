@@ -4,27 +4,24 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:workmanager/workmanager.dart';
 import 'app/app.dart';
 import 'core/backup/headless_sync.dart';
+import 'core/download/download_worker.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // MIUI/Xiaomi aggressively dozes the app and cuts its network the moment the
-  // screen dims, which makes Telegram connections time out mid-use. Keeping the
-  // screen awake while the app is in the foreground avoids that. (Background
-  // network still needs the user to disable battery restrictions for the app.)
-  if (Platform.isAndroid || Platform.isIOS) {
-    WakelockPlus.enable();
-  }
+  // No permanent wakelock: keeping the screen on for the whole session made
+  // the phone hot and throttled it. Background network on MIUI still needs the
+  // user to disable battery restrictions for the app (requested at startup by
+  // BackgroundExecutionService).
 
   // Cap the in-memory decoded-image cache so scrolling a large gallery can't
   // accumulate thousands of bitmaps and run out of memory.
   PaintingBinding.instance.imageCache
-    ..maximumSize = 200
-    ..maximumSizeBytes = 100 << 20; // 100 MB
+    ..maximumSize = 600
+    ..maximumSizeBytes = 120 << 20; // 120 MB
 
   // Required for in-app video playback (Windows + Android).
   MediaKit.ensureInitialized();
@@ -40,6 +37,10 @@ void main() async {
   // regardless of whether their UI has ever been launched since. Android
   // won't run this more often than every ~15 minutes; see headless_sync.dart
   // for what the task itself does and why that's an acceptable trade-off.
+  // The periodic task is only a cheap check with no notification; when files
+  // are pending it schedules a one-off foreground run (headless_sync.dart).
+  // `update` (not `keep`) so the registered spec always matches this code;
+  // it keeps the existing schedule and never cancels a running run.
   if (Platform.isAndroid) {
     unawaited(() async {
       await Workmanager().initialize(callbackDispatcher);
@@ -48,9 +49,18 @@ void main() async {
         uploadSyncTaskName,
         frequency: const Duration(minutes: 15),
         constraints: Constraints(networkType: NetworkType.connected),
-        existingWorkPolicy: ExistingPeriodicWorkPolicy.keep,
+        existingWorkPolicy: ExistingPeriodicWorkPolicy.update,
       );
     }());
+  }
+
+  // Every Telegram download response is AES-decrypted in pure Dart on the
+  // isolate that owns the connection; doing that on this one froze the UI
+  // while browsing. Route downloads to their own isolate (see
+  // download_worker.dart). Android only: that's where it was measured and
+  // where the background-isolate plugin setup is exercised.
+  if (Platform.isAndroid) {
+    DownloadWorker.enabled = true;
   }
 
   runApp(const ProviderScope(child: TeleVaultApp()));

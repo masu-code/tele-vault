@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.44.2"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and check it matches pubspec.yaml
+        id: ver
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PUBSPEC_VERSION="$(sed -n 's/^version: *\([^+ ]*\).*/\1/p' pubspec.yaml | head -n1)"
+          if [ "$VERSION" != "$PUBSPEC_VERSION" ]; then
+            echo "Tag version ($VERSION) does not match pubspec.yaml ($PUBSPEC_VERSION)." >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          case "$VERSION" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found && /^\[[^]]+\]: / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "No CHANGELOG.md section found for version $VERSION." >&2
+            exit 1
+          fi
+          cat release-notes.md
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libsqlite3-dev
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Test
+        run: flutter test
+
+      - name: Configure release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required secret: $name" >&2
+              exit 1
+            fi
+          done
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/release.jks
+          # storeFile is resolved relative to the android/app module.
+          {
+            echo "storeFile=release.jks"
+            echo "storePassword=$ANDROID_KEYSTORE_PASSWORD"
+            echo "keyAlias=$ANDROID_KEY_ALIAS"
+            echo "keyPassword=$ANDROID_KEY_PASSWORD"
+          } > android/key.properties
+
+      - name: Build split-per-ABI APKs
+        run: flutter build apk --release --split-per-abi
+
+      - name: Build universal APK
+        run: flutter build apk --release
+
+      - name: Collect artifacts and checksums
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p dist
+          OUT=build/app/outputs/flutter-apk
+          cp "$OUT/app-arm64-v8a-release.apk"   "dist/TeleVault-v${VERSION}-arm64-v8a.apk"
+          cp "$OUT/app-armeabi-v7a-release.apk" "dist/TeleVault-v${VERSION}-armeabi-v7a.apk"
+          cp "$OUT/app-x86_64-release.apk"      "dist/TeleVault-v${VERSION}-x86_64.apk"
+          cp "$OUT/app-release.apk"             "dist/TeleVault-v${VERSION}-universal.apk"
+          cd dist
+          sha256sum *.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f android/app/release.jks android/key.properties
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: TeleVault ${{ github.ref_name }}
+          body_path: release-notes.md
+          prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
+          files: |
+            dist/*.apk
+            dist/SHA256SUMS.txt

@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../../shell/main_shell.dart';
 import '../providers/auth_provider.dart';
 
 class TwoFaScreen extends ConsumerStatefulWidget {
@@ -29,21 +28,20 @@ class _TwoFaScreenState extends ConsumerState<TwoFaScreen> {
       // pushed on top of it (Phone -> Otp -> TwoFa) — without this, a
       // successful password check leaves the user stuck looking at this
       // screen forever even though the app is actually logged in
-      // underneath. Replace the whole stack so MainShell is what's left.
+      // underneath. Pop back to the root, which by now IS MainShell —
+      // pushing a second one would run its whole startup sequence twice.
       if (next.step == AuthStep.authenticated) {
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const MainShell()),
-          (route) => false,
-        );
+        Navigator.of(context).popUntil((route) => route.isFirst);
       }
     });
 
     return Scaffold(
       appBar: AppBar(title: const Text('Two-Step Verification')),
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(32),
           child: Column(
+            mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const SizedBox(height: 24),

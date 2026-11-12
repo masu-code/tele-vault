@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:tele_vault/models/album.dart';
 import 'package:tele_vault/models/file_index.dart';
 import 'package:tele_vault/models/file_item.dart';
 import 'package:tele_vault/models/file_part.dart';
@@ -114,6 +115,50 @@ void main() {
       final added = const FileIndex().addFile(file);
       expect(added.files.length, 1);
       expect(added.removeFile('n').files, isEmpty);
+    });
+  });
+
+  group('FileIndex.merge', () {
+    test('later snapshot wins for album fields, member ids are unioned', () {
+      final created = DateTime.parse('2026-06-19T00:00:00.000Z');
+      final old = FileIndex(
+          albums: [Album(id: 'a', name: 'Old name', fileIds: const ['x'], createdAt: created)]);
+      final live = FileIndex(
+          albums: [Album(id: 'a', name: 'Live name', fileIds: const ['y'], createdAt: created)]);
+      final merged = FileIndex.merge([old, live]);
+      expect(merged.albums.single.name, 'Live name');
+      expect(merged.albums.single.fileIds, ['x', 'y']);
+    });
+  });
+
+  group('FileIndex.findUpload', () {
+    final index = FileIndex(files: [
+      FileItem(
+        id: 'existing',
+        name: 'IMG_0001.jpg',
+        folderId: null,
+        totalSize: 12345,
+        mimeType: 'image/jpeg',
+        createdAt: DateTime.parse('2026-06-19T00:00:00.000Z'),
+        parts: const [FilePart(messageId: 1, part: 0, size: 12345)],
+      ),
+    ]);
+
+    test('matches on exact name and size — the reinstall-healing case', () {
+      final found = index.findUpload('IMG_0001.jpg', 12345);
+      expect(found?.id, 'existing');
+    });
+
+    test('same name, different size is not a match', () {
+      expect(index.findUpload('IMG_0001.jpg', 99), isNull);
+    });
+
+    test('same size, different name is not a match', () {
+      expect(index.findUpload('IMG_9999.jpg', 12345), isNull);
+    });
+
+    test('no match returns null', () {
+      expect(index.findUpload('nope.jpg', 1), isNull);
     });
   });
 }

@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -7,6 +9,7 @@ import 'package:share_plus/share_plus.dart';
 import '../../../core/backup/asset_upload_service.dart';
 import '../../../core/backup/device_state_bus.dart';
 import '../../../core/download/download_service.dart';
+import '../../backup/providers/backup_provider.dart';
 import '../../download/providers/download_provider.dart';
 import '../../explorer/providers/index_provider.dart';
 import '../../preview/screens/mixed_media_viewer_screen.dart';
@@ -15,8 +18,10 @@ import '../../preview/widgets/delete_source_dialog.dart';
 import '../../profile/widgets/floating_profile_header.dart';
 import '../../shell/scroll_to_top.dart';
 import '../../transfer/providers/transfer_queue_provider.dart';
+import '../../../core/thumbnail/thumb_prefetcher.dart';
 import '../models/gallery_entry.dart';
 import '../providers/gallery_feed_provider.dart';
+import '../providers/thumb_prefetch_provider.dart';
 import '../services/gallery_feed_service.dart';
 import '../widgets/fast_scrollbar.dart';
 import '../widgets/gallery_tile.dart';
@@ -33,10 +38,21 @@ class GalleryScreen extends ConsumerStatefulWidget {
   ConsumerState<GalleryScreen> createState() => _GalleryScreenState();
 }
 
-class _GalleryScreenState extends ConsumerState<GalleryScreen> {
-  final Set<String> _selected = {};
+class _GalleryScreenState extends ConsumerState<GalleryScreen>
+    with WidgetsBindingObserver {
+  /// Selected entry keys. Tiles and the selection app bar listen to it
+  /// directly, so toggling an item rebuilds neither this screen nor the
+  /// slivers; only entering/leaving selection mode (empty <-> not empty) does.
+  final ValueNotifier<Set<String>> _selection = ValueNotifier(const {});
   bool _selecting = false;
   final ScrollController _scrollController = ScrollController();
+
+  // Slivers are rebuilt only when one of these changes (see _slivers).
+  List<Widget>? _sliverCache;
+  List<GalleryMonthGroup>? _cachedGroups;
+  List<GalleryEntry>? _cachedFlat;
+  double? _cachedTopInset;
+  bool? _cachedBanner;
 
   /// Whether this device has granted (full or limited) photo library access.
   /// Null while the initial passive check is in flight; false shows the
@@ -46,20 +62,46 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
   @override
   void initState() {
     super.initState();
-    if (Platform.isAndroid) {
-      PhotoManager.getPermissionState(requestOption: const PermissionRequestOption())
-          .then((s) {
-        if (mounted) setState(() => _hasDeviceAccess = s.hasAccess);
-      });
-    } else {
-      _hasDeviceAccess = false;
-    }
+    WidgetsBinding.instance.addObserver(this);
+    _selection.addListener(_onSelectionChanged);
+    ref.read(thumbPrefetchBindingProvider);
+    _checkDeviceAccess();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _selection.removeListener(_onSelectionChanged);
+    _selection.dispose();
     _scrollController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Permission can change while this screen never rebuilds on its own:
+    // granted from the Albums tab's own request flow (MainShell keeps every
+    // tab alive in an IndexedStack, so Gallery's initState only ever runs
+    // once), or from system Settings entirely outside the app. Either way,
+    // coming back to the foreground is exactly when that could have
+    // happened — re-check then instead of only once at startup, which used
+    // to mean the feed stayed empty until a full app restart.
+    if (state == AppLifecycleState.resumed) _checkDeviceAccess();
+  }
+
+  void _checkDeviceAccess() {
+    if (!Platform.isAndroid) {
+      _hasDeviceAccess = false;
+      return;
+    }
+    PhotoManager.getPermissionState(
+      requestOption: const PermissionRequestOption(),
+    ).then((s) {
+      if (!mounted) return;
+      final gained = _hasDeviceAccess != true && s.hasAccess;
+      setState(() => _hasDeviceAccess = s.hasAccess);
+      if (gained) ref.invalidate(galleryFeedProvider);
+    });
   }
 
   void _scrollToTop() {
@@ -75,51 +117,69 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
     final state = await PhotoManager.requestPermissionExtend();
     if (mounted) setState(() => _hasDeviceAccess = state.hasAccess);
     ref.invalidate(galleryFeedProvider);
+    // The Albums tab's device albums come from a separate, once-only load
+    // that already ran (and found nothing) back when there was no
+    // permission — without this, granting access here would repopulate the
+    // Gallery timeline but leave Albums empty until the next app restart.
+    if (state.hasAccess) {
+      unawaited(ref.read(backupProvider.notifier).loadDeviceAlbums());
+    }
   }
 
-  void _exitSelection() => setState(() {
-        _selecting = false;
-        _selected.clear();
-      });
+  // Rebuilds the screen only when selection mode starts or ends.
+  void _onSelectionChanged() {
+    final selecting = _selection.value.isNotEmpty;
+    if (selecting != _selecting && mounted) {
+      setState(() => _selecting = selecting);
+    }
+  }
+
+  void _exitSelection() => _selection.value = const {};
 
   void _toggle(GalleryEntry entry) {
-    setState(() {
-      if (!_selected.remove(entry.key)) _selected.add(entry.key);
-      if (_selected.isEmpty) _selecting = false;
-    });
+    final next = Set<String>.of(_selection.value);
+    if (!next.remove(entry.key)) next.add(entry.key);
+    _selection.value = next;
   }
 
   void _startSelection(GalleryEntry entry) {
-    setState(() {
-      _selecting = true;
-      _selected.add(entry.key);
-    });
+    _selection.value = {..._selection.value, entry.key};
   }
 
-  List<GalleryEntry> _selectedEntries(List<GalleryEntry> flat) =>
-      flat.where((e) => _selected.contains(e.key)).toList();
+  List<GalleryEntry> _selectedEntries(List<GalleryEntry> flat) {
+    final selected = _selection.value;
+    return flat.where((e) => selected.contains(e.key)).toList();
+  }
 
   Future<void> _shareSelected(List<GalleryEntry> flat) async {
     final selected = _selectedEntries(flat);
     if (selected.isEmpty) return;
     try {
-      final locals = await Future.wait(selected.map((e) async {
-        if (e.fileItem != null) return DownloadService.instance.downloadToCache(e.fileItem!);
-        final f = await e.asset!.file;
-        if (f == null) throw Exception('Could not read file from device.');
-        return f;
-      }));
-      await SharePlus.instance.share(ShareParams(files: locals.map((f) => XFile(f.path)).toList()));
+      final locals = await Future.wait(
+        selected.map((e) async {
+          if (e.fileItem != null)
+            return DownloadService.instance.downloadToCache(e.fileItem!);
+          final f = await e.asset!.file;
+          if (f == null) throw Exception('Could not read file from device.');
+          return f;
+        }),
+      );
+      await SharePlus.instance.share(
+        ShareParams(files: locals.map((f) => XFile(f.path)).toList()),
+      );
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not share: $e')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Could not share: $e')));
       }
     }
   }
 
   void _uploadSelected(List<GalleryEntry> flat) {
-    final toUpload =
-        _selectedEntries(flat).where((e) => e.fileItem == null).map((e) => e.asset!).toList();
+    final toUpload = _selectedEntries(
+      flat,
+    ).where((e) => e.fileItem == null).map((e) => e.asset!).toList();
     if (toUpload.isEmpty) return;
     _exitSelection();
     ref.read(transferQueueProvider.notifier).enqueueUploads(toUpload);
@@ -149,7 +209,10 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
       // Device-only entries are auto-uploaded first — a vault album can only
       // reference cloud files.
       try {
-        final uploadedItem = await AssetUploadService.instance.uploadAndLink(ref, entry.asset!);
+        final uploadedItem = await AssetUploadService.instance.uploadAndLink(
+          ref,
+          entry.asset!,
+        );
         fileIds.add(uploadedItem.id);
       } catch (e) {
         uploadError = e.toString();
@@ -160,7 +223,9 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
 
     if (fileIds.isEmpty) {
       if (uploadError != null && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Upload failed: $uploadError')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Upload failed: $uploadError')));
       }
       return;
     }
@@ -168,9 +233,19 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
     await addFileIdsToAlbum(context, ref, fileIds);
     if (uploadError != null && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Some items could not be uploaded: $uploadError')),
+        SnackBar(
+          content: Text('Some items could not be uploaded: $uploadError'),
+        ),
       );
     }
+  }
+
+  void _archiveSelected(List<GalleryEntry> flat) {
+    final ids = _selectedEntries(
+      flat,
+    ).where((e) => e.fileItem != null).map((e) => e.fileItem!.id).toList();
+    _exitSelection();
+    if (ids.isNotEmpty) ref.read(indexProvider.notifier).archiveFiles(ids);
   }
 
   Future<void> _deleteSelected(List<GalleryEntry> flat) async {
@@ -179,22 +254,37 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
 
     final anyOnDevice = selected.any((e) => e.isOnDevice);
     final anyInCloud = selected.any((e) => e.isUploaded);
-    final source = await askDeleteSource(context, existsOnDevice: anyOnDevice, existsInCloud: anyInCloud);
+    final source = await askDeleteSource(
+      context,
+      existsOnDevice: anyOnDevice,
+      existsInCloud: anyInCloud,
+    );
     if (source == null) return;
 
     if (source == DeleteSource.cloud || source == DeleteSource.both) {
-      final cloudItems = selected.where((e) => e.fileItem != null).map((e) => e.fileItem!).toList();
-      if (cloudItems.isNotEmpty) await ref.read(indexProvider.notifier).deleteFiles(cloudItems);
+      final cloudItems = selected
+          .where((e) => e.fileItem != null)
+          .map((e) => e.fileItem!)
+          .toList();
+      if (cloudItems.isNotEmpty)
+        await ref.read(indexProvider.notifier).deleteFiles(cloudItems);
     }
     if (source == DeleteSource.device || source == DeleteSource.both) {
-      final assetIds = selected.where((e) => e.asset != null).map((e) => e.asset!.id).toList();
+      final assetIds = selected
+          .where((e) => e.asset != null)
+          .map((e) => e.asset!.id)
+          .toList();
       if (assetIds.isNotEmpty) {
         final deleted = await PhotoManager.editor.deleteWithIds(assetIds);
         await PhotoManager.clearFileCache();
         if (deleted.length < assetIds.length && mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text("Some items weren't deleted — Android's own confirmation wasn't approved."),
-          ));
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                "Some items weren't deleted — Android's own confirmation wasn't approved.",
+              ),
+            ),
+          );
         }
       }
     }
@@ -212,55 +302,38 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
       if (next != null && next.tabIndex == 0) _scrollToTop();
     });
     ref.listen(downloadProvider, (prev, next) {
-      final msg = next.savedMessage ?? (next.error != null ? 'Failed: ${next.error}' : null);
-      if (msg != null && (next.savedMessage != prev?.savedMessage || next.error != prev?.error)) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+      final msg =
+          next.savedMessage ??
+          (next.error != null ? 'Failed: ${next.error}' : null);
+      if (msg != null &&
+          (next.savedMessage != prev?.savedMessage ||
+              next.error != prev?.error)) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(msg)));
       }
     });
     ref.listen(indexProvider, (prev, next) {
-      if (next.mutationError != null && next.mutationError != prev?.mutationError) {
+      if (next.mutationError != null &&
+          next.mutationError != prev?.mutationError) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Action failed: ${next.mutationError}')),
         );
       }
     });
 
-    final selectedEntries = _selectedEntries(flat);
-    final needsUpload = selectedEntries.any((e) => e.fileItem == null);
-    final needsDownload = selectedEntries.any((e) => e.fileItem != null && e.asset == null);
-
     return Scaffold(
       appBar: _selecting
-          ? AppBar(
-              leading: IconButton(icon: const Icon(Icons.close), onPressed: _exitSelection),
-              title: Text('${_selected.length} selected'),
-              actions: [
-                IconButton(
-                  icon: const Icon(Icons.share_outlined),
-                  tooltip: 'Share',
-                  onPressed: () => _shareSelected(flat),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.cloud_upload_outlined),
-                  tooltip: 'Upload',
-                  onPressed: needsUpload ? () => _uploadSelected(flat) : null,
-                ),
-                IconButton(
-                  icon: const Icon(Icons.download_outlined),
-                  tooltip: 'Download',
-                  onPressed: needsDownload ? () => _downloadSelected(flat) : null,
-                ),
-                IconButton(
-                  icon: const Icon(Icons.playlist_add),
-                  tooltip: 'Add to album',
-                  onPressed: () => _addSelectedToAlbum(flat),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.delete_outline),
-                  tooltip: 'Delete',
-                  onPressed: () => _deleteSelected(flat),
-                ),
-              ],
+          ? _SelectionAppBar(
+              selection: _selection,
+              flat: flat,
+              onExit: _exitSelection,
+              onShare: () => _shareSelected(flat),
+              onUpload: () => _uploadSelected(flat),
+              onDownload: () => _downloadSelected(flat),
+              onAddToAlbum: () => _addSelectedToAlbum(flat),
+              onArchive: () => _archiveSelected(flat),
+              onDelete: () => _deleteSelected(flat),
             )
           : null,
       body: Stack(
@@ -284,8 +357,11 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
       skipLoadingOnRefresh: true,
       loading: () => const Center(child: CircularProgressIndicator()),
       error: (e, _) => Center(
-        child: Text('Could not load gallery: $e',
-            textAlign: TextAlign.center, style: const TextStyle(color: Colors.white54)),
+        child: Text(
+          'Could not load gallery: $e',
+          textAlign: TextAlign.center,
+          style: const TextStyle(color: Colors.white54),
+        ),
       ),
       data: (groups) {
         if (groups.isEmpty) {
@@ -297,93 +373,169 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
             ),
           );
         }
-        final topInset =
-            _selecting ? 2.0 : MediaQuery.of(context).padding.top + kToolbarHeight + 8;
+        final topInset = _selecting
+            ? 2.0
+            : MediaQuery.of(context).padding.top + kToolbarHeight + 8;
 
-        var index = 0; // running position in the flat list, for tap-to-open
-        final slivers = <Widget>[
-          SliverToBoxAdapter(child: SizedBox(height: topInset)),
-          if (Platform.isAndroid && _hasDeviceAccess == false)
-            SliverToBoxAdapter(child: _permissionBanner()),
-        ];
-        for (final group in groups) {
-          final startIndex = index;
-          slivers.add(SliverPadding(
-            padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
-            sliver: SliverToBoxAdapter(
-              child: Text(monthLabel(group.month),
-                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-            ),
-          ));
-          slivers.add(SliverPadding(
-            padding: const EdgeInsets.symmetric(horizontal: 2),
-            sliver: SliverGrid(
-              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                maxCrossAxisExtent: 120,
-                crossAxisSpacing: 2,
-                mainAxisSpacing: 2,
-              ),
-              delegate: SliverChildBuilderDelegate(
-                (context, i) {
-                  final entry = group.entries[i];
-                  final flatIndex = startIndex + i;
-                  return GalleryTile(
-                    key: ValueKey(entry.key),
-                    entry: entry,
-                    selected: _selected.contains(entry.key),
-                    onLongPress: () => _selecting ? _toggle(entry) : _startSelection(entry),
-                    onTap: () {
-                      if (_selecting) {
-                        _toggle(entry);
-                      } else {
-                        Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (_) =>
-                                MixedMediaViewerScreen(entries: flat, initialIndex: flatIndex),
-                          ),
-                        );
-                      }
-                    },
-                  );
-                },
-                childCount: group.entries.length,
-              ),
-            ),
-          ));
-          index += group.entries.length;
-        }
+        final slivers = _slivers(context, groups, flat, topInset);
 
-        return FastScrollbar(
-          controller: _scrollController,
-          topInset: topInset,
-          bottomInset: 12,
-          // An estimate: it maps scroll fraction straight onto the flat entry
-          // list, which ignores the extra height month headers add. Good
-          // enough to aim at a month while scrubbing, and far cheaper than
-          // measuring real sliver geometry on every drag frame.
-          labelForFraction: (f) {
-            if (flat.isEmpty) return null;
-            final i = (f * (flat.length - 1)).round().clamp(0, flat.length - 1);
-            return monthLabel(flat[i].effectiveDate.toLocal());
-          },
-          child: RefreshIndicator(
-            onRefresh: () async {
-              GalleryFeedService.instance.invalidateCache();
-              ref.invalidate(galleryFeedProvider);
-              await ref.read(galleryFeedProvider.future);
+        return NotificationListener<ScrollNotification>(
+          onNotification: handleGalleryScroll,
+          child: FastScrollbar(
+            controller: _scrollController,
+            topInset: topInset,
+            bottomInset: 12,
+            // An estimate: it maps scroll fraction straight onto the flat
+            // entry list, which ignores the extra height month headers add.
+            // Good enough to aim at a month while scrubbing, and far cheaper
+            // than measuring real sliver geometry on every drag frame.
+            labelForFraction: (f) {
+              if (flat.isEmpty) return null;
+              final i = (f * (flat.length - 1)).round().clamp(
+                0,
+                flat.length - 1,
+              );
+              return monthLabel(flat[i].effectiveDate.toLocal());
             },
-            // Builds tiles ~2 screens ahead of the viewport so their
-            // thumbnail requests start before they're actually visible,
-            // instead of popping in right at the edge of the screen.
-            child: CustomScrollView(
-              controller: _scrollController,
-              scrollCacheExtent: const ScrollCacheExtent.pixels(1000),
-              slivers: slivers,
+            child: RefreshIndicator(
+              onRefresh: () async {
+                ThumbPrefetcher.instance.retryFailedNow();
+                GalleryFeedService.instance.invalidateCache();
+                ref.invalidate(galleryFeedProvider);
+                await ref.read(galleryFeedProvider.future);
+              },
+              // Builds tiles ~2 screens ahead of the viewport so their
+              // thumbnail requests start before they're actually visible,
+              // instead of popping in right at the edge of the screen.
+              child: CustomScrollView(
+                // Survives a rebuild of this subtree with its offset intact.
+                // Every completed upload recomputes the feed and rebuilds
+                // every sliver here; without a storage key a rebuild that
+                // recreates the Scrollable starts back at offset zero, which
+                // is what threw the grid to the top mid-upload.
+                key: const PageStorageKey<String>('gallery-timeline'),
+                controller: _scrollController,
+                scrollCacheExtent: const ScrollCacheExtent.pixels(1000),
+                slivers: slivers,
+              ),
             ),
           ),
         );
       },
     );
+  }
+
+  /// The grid's slivers. Rebuilt only when the groups list, the flat list, the
+  /// top inset or the permission banner changes: a screen rebuild for any other
+  /// reason (selection mode, permission state) reuses the same widget instances,
+  /// which Flutter skips, instead of re-running every visible tile's builder.
+  List<Widget> _slivers(
+    BuildContext context,
+    List<GalleryMonthGroup> groups,
+    List<GalleryEntry> flat,
+    double topInset,
+  ) {
+    final banner = Platform.isAndroid && _hasDeviceAccess == false;
+    final cached = _sliverCache;
+    if (cached != null &&
+        identical(_cachedGroups, groups) &&
+        identical(_cachedFlat, flat) &&
+        _cachedTopInset == topInset &&
+        _cachedBanner == banner) {
+      return cached;
+    }
+    var index = 0; // running position in the flat list, for tap-to-open
+    final slivers = <Widget>[
+      SliverToBoxAdapter(child: SizedBox(height: topInset)),
+      if (banner) SliverToBoxAdapter(child: _permissionBanner()),
+    ];
+    for (final group in groups) {
+      final startIndex = index;
+      // Keyed by month so a feed rebuild (every upload bumps
+      // deviceStateVersion, which recomputes the whole feed) re-attaches
+      // each sliver to the same month rather than to whatever now sits
+      // at that position. Without keys, one new month at the top shifts
+      // every sliver by two and the framework matches them by position.
+      slivers.add(
+        SliverPadding(
+          key: ValueKey('header-${group.month.toIso8601String()}'),
+          padding: const EdgeInsets.fromLTRB(12, 20, 12, 10),
+          sliver: SliverToBoxAdapter(
+            child: Text(
+              monthHeaderLabel(group.month, DateTime.now().year),
+              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
+            ),
+          ),
+        ),
+      );
+      // Captured per group so findChildIndexCallback below closes over
+      // the right list. The lookup map is built at most once per group
+      // per rebuild, and only if the sliver actually asks — a linear
+      // scan per child would be O(children × entries) on every upload.
+      final entries = group.entries;
+      Map<String, int>? indexByKey;
+      slivers.add(
+        SliverPadding(
+          key: ValueKey('grid-${group.month.toIso8601String()}'),
+          padding: const EdgeInsets.symmetric(horizontal: 2),
+          sliver: SliverGrid(
+            gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+              maxCrossAxisExtent: 120,
+              crossAxisSpacing: 2,
+              mainAxisSpacing: 2,
+            ),
+            delegate: SliverChildBuilderDelegate(
+              (context, i) {
+                final entry = entries[i];
+                final flatIndex = startIndex + i;
+                return SelectionScopedTile(
+                  key: ValueKey(entry.key),
+                  entry: entry,
+                  selection: _selection,
+                  onLongPress: () => _selection.value.isNotEmpty
+                      ? _toggle(entry)
+                      : _startSelection(entry),
+                  onTap: () {
+                    if (_selection.value.isNotEmpty) {
+                      _toggle(entry);
+                    } else {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => MixedMediaViewerScreen(
+                            entries: flat,
+                            initialIndex: flatIndex,
+                          ),
+                        ),
+                      );
+                    }
+                  },
+                );
+              },
+              childCount: entries.length,
+              // New photos land at the FRONT of the newest month, so
+              // every already-built tile shifts index on each upload.
+              // Without this the sliver can't match a keyed child to its
+              // new index, so it throws the element away and rebuilds it
+              // from scratch — which is what made an upload land as a
+              // visible lurch in the grid instead of a quiet insert.
+              findChildIndexCallback: (Key key) {
+                if (key is! ValueKey<String>) return null;
+                final map = indexByKey ??= {
+                  for (var i = 0; i < entries.length; i++) entries[i].key: i,
+                };
+                return map[key.value];
+              },
+            ),
+          ),
+        ),
+      );
+      index += group.entries.length;
+    }
+    _cachedGroups = groups;
+    _cachedFlat = flat;
+    _cachedTopInset = topInset;
+    _cachedBanner = banner;
+    return _sliverCache = slivers;
   }
 
   Widget _permissionBanner() {
@@ -396,7 +548,11 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
       ),
       child: Row(
         children: [
-          const Icon(Icons.photo_library_outlined, color: Color(0xFF2AABEE), size: 20),
+          const Icon(
+            Icons.photo_library_outlined,
+            color: Color(0xFF2AABEE),
+            size: 20,
+          ),
           const SizedBox(width: 10),
           const Expanded(
             child: Text(
@@ -407,6 +563,93 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen> {
           TextButton(onPressed: _grantDeviceAccess, child: const Text('Allow')),
         ],
       ),
+    );
+  }
+}
+
+/// App bar of selection mode. Listens to [selection] itself so the count and
+/// the enabled actions follow it without the screen rebuilding.
+class _SelectionAppBar extends StatelessWidget implements PreferredSizeWidget {
+  const _SelectionAppBar({
+    required this.selection,
+    required this.flat,
+    required this.onExit,
+    required this.onShare,
+    required this.onUpload,
+    required this.onDownload,
+    required this.onAddToAlbum,
+    required this.onArchive,
+    required this.onDelete,
+  });
+
+  final ValueListenable<Set<String>> selection;
+  final List<GalleryEntry> flat;
+  final VoidCallback onExit;
+  final VoidCallback onShare;
+  final VoidCallback onUpload;
+  final VoidCallback onDownload;
+  final VoidCallback onAddToAlbum;
+  final VoidCallback onArchive;
+  final VoidCallback onDelete;
+
+  @override
+  Size get preferredSize => const Size.fromHeight(kToolbarHeight);
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<Set<String>>(
+      valueListenable: selection,
+      builder: (context, selected, _) {
+        var needsUpload = false;
+        var needsDownload = false;
+        // Only cloud-backed entries can be archived — see FileItem.archived.
+        var canArchive = false;
+        for (final e in flat) {
+          if (!selected.contains(e.key)) continue;
+          if (e.fileItem == null) {
+            needsUpload = true;
+          } else {
+            canArchive = true;
+            if (e.asset == null) needsDownload = true;
+          }
+        }
+        return AppBar(
+          leading: IconButton(icon: const Icon(Icons.close), onPressed: onExit),
+          title: Text('${selected.length} selected'),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.share_outlined),
+              tooltip: 'Share',
+              onPressed: onShare,
+            ),
+            IconButton(
+              icon: const Icon(Icons.cloud_upload_outlined),
+              tooltip: 'Upload',
+              onPressed: needsUpload ? onUpload : null,
+            ),
+            IconButton(
+              icon: const Icon(Icons.download_outlined),
+              tooltip: 'Download',
+              onPressed: needsDownload ? onDownload : null,
+            ),
+            IconButton(
+              icon: const Icon(Icons.playlist_add),
+              tooltip: 'Add to album',
+              onPressed: onAddToAlbum,
+            ),
+            IconButton(
+              icon: const Icon(Icons.archive_outlined),
+              tooltip: 'Archive',
+              onPressed: canArchive ? onArchive : null,
+            ),
+            IconButton(
+              icon: const Icon(Icons.delete_outline),
+              tooltip: 'Delete',
+              onPressed: onDelete,
+            ),
+          ],
+        );
+      },
     );
   }
 }

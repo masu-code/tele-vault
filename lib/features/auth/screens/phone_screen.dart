@@ -23,8 +23,13 @@ class _PhoneScreenState extends ConsumerState<PhoneScreen> {
   Widget build(BuildContext context) {
     final auth = ref.watch(authProvider);
 
-    ref.listen(authProvider, (_, next) {
-      if (next.step == AuthStep.waitingCode) {
+    // Only on the *transition* into waitingCode. Without the previous-step
+    // check this fired on every later emission that kept step == waitingCode
+    // — e.g. a failed signIn setting an error — and pushed a second OtpScreen
+    // on top of the one the user was already typing into.
+    ref.listen(authProvider, (previous, next) {
+      if (previous?.step != AuthStep.waitingCode &&
+          next.step == AuthStep.waitingCode) {
         Navigator.of(context).push(
           MaterialPageRoute(builder: (_) => const OtpScreen()),
         );
@@ -32,11 +37,15 @@ class _PhoneScreenState extends ConsumerState<PhoneScreen> {
     });
 
     return Scaffold(
+      // Scrollable and min-sized: in landscape (and with the keyboard up on a
+      // short screen) the fixed Column overflowed the viewport — the login
+      // screen rendered with the yellow-and-black overflow stripes across the
+      // Send Code button.
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(32),
           child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
+            mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Icon(Icons.cloud_outlined, size: 56, color: Color(0xFF2AABEE)),
