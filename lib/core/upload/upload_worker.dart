@@ -80,6 +80,11 @@ class UploadWorker {
     _completers.remove(id)?.complete(msg);
   }
 
+  /// Log out: tells the worker to drop its connection and session key (it
+  /// holds its own copy, read once from the session file). No-op when the
+  /// worker was never started. Queued behind an upload already in flight.
+  void resetSession() => _sendPort?.send({'type': 'reset'});
+
   /// Uploads the file at [path] on the worker isolate. Same contract as
   /// [UploadService.uploadFile] (same [UploadException] on failure), including
   /// the optional [thumbJpeg] preview and its `th1:` [preview] string —
@@ -136,6 +141,13 @@ void _entry(_IsolateInit init) async {
   print('TVDIAG: entering await-for message loop');
   await for (final raw in port) {
     final msg = (raw as Map).cast<String, dynamic>();
+    if (msg['type'] == 'reset') {
+      // Log out: forget this isolate's connection and key; the next upload
+      // re-reads the saved session (the next account's, or none).
+      restored = false;
+      await TelegramService.instance.dropConnection();
+      continue;
+    }
     final id = msg['id'] as int;
     // ignore: avoid_print
     print('TVDIAG: received upload request id=$id');

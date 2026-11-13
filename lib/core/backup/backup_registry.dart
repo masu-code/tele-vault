@@ -9,6 +9,9 @@ import 'package:sqflite/sqflite.dart' show DatabaseFactory;
 import 'heartbeat.dart';
 import 'registry_store.dart';
 
+/// What [BackupRegistry.bindAccount] found.
+enum AccountBinding { first, same, switched }
+
 /// Persists which device asset IDs have been uploaded, which cloud file each
 /// one became, where the local copy lives, and the small backup settings.
 ///
@@ -320,13 +323,97 @@ class BackupRegistry {
   }) async {
     await init();
     await _s.addPendingIndex(
-        (assetId: assetId, fileItemId: fileItemId, itemJson: itemJson, path: path));
+      (assetId: assetId, fileItemId: fileItemId, itemJson: itemJson, path: path),
+      account: account,
+    );
   }
 
-  /// Every upload still waiting for its index write, oldest first.
+  /// Rows of other accounts last reported by [pendingIndex], so the skip is
+  /// logged when it changes, not on every call.
+  int _loggedForeignRows = 0;
+
+  /// Every upload still waiting for its index write, oldest first — those of
+  /// the account the registry is bound to (see [bindAccount]). Rows another
+  /// account uploaded stay in the database untouched (that account may log
+  /// back in) but are never returned, so they can never be written into the
+  /// current account's index. Rows with no account recorded (written before
+  /// accounts were tracked) belong to whoever is bound, as before.
   Future<List<PendingIndexRow>> pendingIndex() async {
     await init();
-    return _s.pendingIndex();
+    final current = account;
+    final tagged = await _s.pendingIndexTagged();
+    if (current == null) return [for (final r in tagged) r.row];
+    final mine = <PendingIndexRow>[];
+    var foreign = 0;
+    for (final r in tagged) {
+      if (r.account == null || r.account == current) {
+        mine.add(r.row);
+      } else {
+        foreign++;
+      }
+    }
+    if (foreign != _loggedForeignRows) {
+      _loggedForeignRows = foreign;
+      if (foreign > 0) {
+        debugPrint('TVDIAG: registry: skipping $foreign pending-index row(s) '
+            'of another account');
+      }
+    }
+    return mine;
+  }
+
+  // -- account --------------------------------------------------------------
+
+  /// Telegram user id the registry's links (asset <-> cloud file <-> local
+  /// path, uploaded flags, pending-index rows) belong to; null until the
+  /// first login after accounts began to be recorded.
+  ///
+  /// It is the user id and not `AuthorizationKey.id` (what the index cache
+  /// records) on purpose: logging in again creates a new key, so the key id
+  /// changes even for the same account, and the registry must survive that.
+  int? get account {
+    _ensure();
+    return int.tryParse(_kv[RegistryKeys.account] ?? '');
+  }
+
+  /// Ties the registry to [userId], the account that is now logged in:
+  ///
+  /// - never bound ([AccountBinding.first]: a fresh install, or an install
+  ///   from before accounts were recorded): the existing content is taken to
+  ///   be this account's and is only tagged;
+  /// - the same account ([AccountBinding.same], e.g. log out and back in):
+  ///   everything is kept, so already-uploaded photos are not uploaded again;
+  /// - another account ([AccountBinding.switched]): the links point at files
+  ///   in someone else's Telegram, so they are cleared — otherwise the new
+  ///   account would believe its device photos are backed up and skip them.
+  ///   Pending-index rows and settings are not touched (see [pendingIndex]).
+  ///
+  /// Call it after every login, before any upload starts.
+  Future<AccountBinding> bindAccount(int userId) async {
+    await init();
+    await reload();
+    final current = account;
+    if (current == userId) return AccountBinding.same;
+    if (current == null) {
+      await _s.tagUntaggedPendingIndex(userId);
+      await _setAccount(userId);
+      return AccountBinding.first;
+    }
+    debugPrint('TVDIAG: registry: different account logged in, clearing links');
+    // Links first, account id last: a crash in between re-runs the clear.
+    await _s.clearLinks();
+    _uploaded.clear();
+    _fileForAsset.clear();
+    _assetForFile.clear();
+    _pathForFile.clear();
+    await _setAccount(userId);
+    return AccountBinding.switched;
+  }
+
+  Future<void> _setAccount(int userId) async {
+    final v = '$userId';
+    await _s.setKvMany({RegistryKeys.account: v});
+    _kv[RegistryKeys.account] = v;
   }
 
   /// Asset ids of [pendingIndex].

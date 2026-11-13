@@ -1,11 +1,11 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:pool/pool.dart';
 import 'package:t/t.dart' as t;
 
 import '../telegram/client.dart';
 import '../telegram/tg_utils.dart';
+import 'adaptive_limiter.dart';
 
 /// Largest side (px) of a Telegram server thumbnail the gallery accepts.
 const int kMaxServerThumbSide = 320;
@@ -13,16 +13,34 @@ const int kMaxServerThumbSide = 320;
 /// At most this many ids per `messages.getMessages` call.
 const int kServerThumbMessagesPerCall = 100;
 
-/// Concurrent `upload.getFile` calls inside one batch.
+/// Most concurrent `upload.getFile` calls (shared by every batch in the
+/// isolate). The real limit starts here and adapts to FLOOD_WAITs.
 const int kServerThumbConcurrency = 4;
 
 /// One thumbnail to fetch: [key] is the ThumbStore key, [messageId] the
-/// Telegram message that carries the file's first part.
+/// Telegram message that carries the file's first part. [priority]: a tile the
+/// user is looking at; it takes the next free `getFile` slot before any
+/// background one.
 class ServerThumbTarget {
-  const ServerThumbTarget(this.key, this.messageId);
+  const ServerThumbTarget(this.key, this.messageId, {this.priority = false});
   final String key;
   final int messageId;
+  final bool priority;
 }
+
+/// The concurrency limit of every bulk `getFile` of this isolate (statics are
+/// per isolate: each worker has its own, like its own flood gate). Created on
+/// first use, and wired to the flood gate so a FLOOD_WAIT halves it.
+AdaptiveLimiter get serverThumbLimiter {
+  final limiter = _limiter ??= AdaptiveLimiter(max: kServerThumbConcurrency);
+  TelegramService.instance.onFloodGate ??= (_) {
+    limiter.onFlood();
+    return limiter.limit;
+  };
+  return limiter;
+}
+
+AdaptiveLimiter? _limiter;
 
 /// Argument of [fetchServerThumbs]. Plain data, sendable between isolates.
 class ServerThumbArgs {
@@ -70,32 +88,32 @@ t.PhotoSize? pickServerThumb(List<t.PhotoSizeBase>? thumbs) {
 
 /// Downloads Telegram's embedded thumbnails for up to many files in few RPCs:
 /// `getMessages` for <= 100 ids per call, then `getFile` for each thumbnail,
-/// 4 at a time. Top-level so it can run through `DownloadWorker.run` (its
-/// AES work then stays off the UI isolate). Never throws for per-file
-/// problems: those become `error`/`none` results.
+/// up to 4 at a time through [serverThumbLimiter] (fewer while Telegram is
+/// answering FLOOD_WAIT; priority targets go first). Top-level so it can run
+/// through `DownloadWorker.run` (its AES work then stays off the UI isolate).
+/// Never throws for per-file problems: those become `error`/`none` results.
 Future<List<ServerThumbResult>> fetchServerThumbs(ServerThumbArgs args) async {
   final results = <ServerThumbResult>[];
   final targets = args.targets;
-  final pool = Pool(kServerThumbConcurrency);
-  try {
-    for (var i = 0; i < targets.length; i += kServerThumbMessagesPerCall) {
-      final chunk = targets.sublist(
-        i,
-        math.min(i + kServerThumbMessagesPerCall, targets.length),
-      );
-      final documents = await _documentsFor([for (final c in chunk) c.messageId]);
-      if (documents == null) {
-        results.addAll([for (final c in chunk) ServerThumbResult.error(c.key)]);
-        continue;
-      }
-      final chunkResults = await Future.wait([
-        for (final target in chunk)
-          pool.withResource(() => _fetchOne(target, documents[target.messageId])),
-      ]);
-      results.addAll(chunkResults);
+  final limiter = serverThumbLimiter;
+  for (var i = 0; i < targets.length; i += kServerThumbMessagesPerCall) {
+    final chunk = targets.sublist(
+      i,
+      math.min(i + kServerThumbMessagesPerCall, targets.length),
+    );
+    final documents = await _documentsFor([for (final c in chunk) c.messageId]);
+    if (documents == null) {
+      results.addAll([for (final c in chunk) ServerThumbResult.error(c.key)]);
+      continue;
     }
-  } finally {
-    await pool.close();
+    final chunkResults = await Future.wait([
+      for (final target in chunk)
+        limiter.run(
+          () => _fetchOne(target, documents[target.messageId]),
+          priority: target.priority,
+        ),
+    ]);
+    results.addAll(chunkResults);
   }
   return results;
 }

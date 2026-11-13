@@ -9,8 +9,10 @@ import '../../../core/backup/background_execution_service.dart';
 import '../../../core/backup/backup_registry.dart';
 import '../../../core/backup/device_state_bus.dart';
 import '../../../core/local_storage/local_file_service.dart';
+import '../../../core/thumbnail/auto_maintenance_service.dart' show MaintenanceTriggers;
 import '../../../core/thumbnail/thumb_prefetcher.dart' show defaultPreviewFromJpeg;
 import '../../../core/index/index_service.dart' show IndexException;
+import '../../../core/telegram/client.dart' show TelegramService;
 import '../../../core/upload/upload_service.dart'
     show
         FinishedUpload,
@@ -23,7 +25,6 @@ import '../../../core/upload/upload_service.dart'
         uploadThumbFor;
 import '../../../core/upload/upload_worker.dart';
 import '../../../models/file_item.dart';
-import '../../auth/providers/auth_provider.dart';
 import '../../explorer/providers/index_provider.dart';
 
 enum TransferKind { upload, download }
@@ -271,15 +272,19 @@ class TransferQueueNotifier extends StateNotifier<TransferState> {
     state = state.copyWith(currentProgress: progress);
   }
 
-  /// Tracks [e] against [_consecutiveAuthKeyDead] and, once the threshold is
-  /// hit, invalidates the session and reports that the queue should stop.
+  /// Tracks [e] against [_consecutiveAuthKeyDead]. An auth-key failure from
+  /// the worker isolates (their errors only reach this isolate as text) asks
+  /// [TelegramService.confirmRevocation] to verify with a probe — only a
+  /// confirmed revocation logs out, through the AuthNotifier's handler.
+  /// Once the threshold is hit, reports that the queue should stop (the
+  /// session is left alone if the probe found it alive).
   bool _noteFailure(Object e) {
     if (e.toString().contains('AUTH_KEY_UNREGISTERED')) {
       _consecutiveAuthKeyDead++;
+      unawaited(TelegramService.instance.confirmRevocation().catchError((Object _) => false));
       if (_consecutiveAuthKeyDead >= _authKeyDeadThreshold) {
-        debugPrint('TVQUEUE: session appears dead after $_consecutiveAuthKeyDead '
-            'consecutive AUTH_KEY_UNREGISTERED failures — logging out');
-        unawaited(_ref.read(authProvider.notifier).invalidateSession());
+        debugPrint('TVQUEUE: $_consecutiveAuthKeyDead consecutive '
+            'AUTH_KEY_UNREGISTERED failures — stopping the queue');
         return true;
       }
     } else {
@@ -573,6 +578,8 @@ class TransferQueueNotifier extends StateNotifier<TransferState> {
       } else {
         state = const TransferState();
         unawaited(BackgroundExecutionService.instance.disable());
+        // The run just finished: pack the new thumbnails, recover dates.
+        MaintenanceTriggers.queueFinished();
       }
     }
   }

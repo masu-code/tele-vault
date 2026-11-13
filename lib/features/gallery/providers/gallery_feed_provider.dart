@@ -19,9 +19,27 @@ import '../services/undated_shape_diag.dart';
 /// for an answer that only differs at the end.
 const _settleDelay = Duration(milliseconds: 400);
 
+/// Least time between the end of one feed build and the start of the next.
+///
+/// The settle delay only merges changes that arrive closer together than it;
+/// a queue run writes the index once per flushed batch, and on fast uploads
+/// (plus the capture-date stamp and thumbnail backfill writes) those land a
+/// second or so apart, each one a full rebuild. Changes arriving inside this
+/// window are folded into one build at its end.
+const _minBuildInterval = Duration(milliseconds: 1500);
+
+/// When the last feed build's [_minBuildInterval] ends, per container.
+final _feedCooldownProvider = Provider<_FeedCooldown>((ref) => _FeedCooldown());
+
+class _FeedCooldown {
+  Future<void>? until;
+}
+
 /// The flat, sorted (newest-first) unified Gallery feed. Recomputes whenever
 /// the cloud index changes or [deviceStateVersion] is bumped (any
-/// upload/download/delete anywhere in the app), coalescing bursts.
+/// upload/download/delete anywhere in the app), coalescing bursts: at most
+/// one build per [_minBuildInterval]. An unchanged feed comes back as the
+/// same list, and unchanged entries as the same instances (see [adoptFeed]).
 final galleryFeedProvider = FutureProvider<List<GalleryEntry>>((ref) async {
   // select: only the index itself matters, not isSaving/isLoading flips.
   final index = ref.watch(indexProvider.select((s) => s.index));
@@ -33,10 +51,17 @@ final galleryFeedProvider = FutureProvider<List<GalleryEntry>>((ref) async {
   // the newer run's result rather than briefly publishing a stale one.
   var superseded = false;
   ref.onDispose(() => superseded = true);
+  final cooldown = ref.read(_feedCooldownProvider);
   await Future<void>.delayed(_settleDelay);
   if (superseded) return Completer<List<GalleryEntry>>().future;
+  final wait = cooldown.until;
+  if (wait != null) {
+    await wait;
+    if (superseded) return Completer<List<GalleryEntry>>().future;
+  }
 
   final entries = await GalleryFeedService.instance.buildEntries(index);
+  cooldown.until = Future<void>.delayed(_minBuildInterval);
   if (!superseded && ref.read(indexProvider.notifier).remoteSynced) {
     ref.read(captureDateStamperProvider).onFeedBuilt(entries);
     logUndatedShapesOnce(entries);
@@ -59,7 +84,22 @@ final captureDateStamperProvider = Provider<CaptureDateStamper>((ref) {
 });
 
 /// [galleryFeedProvider], grouped into month sections for the timeline UI.
+///
+/// A rebuild triggered by [Ref.watch] (an index change, a [deviceStateVersion]
+/// bump) leaves [galleryFeedProvider] in an [AsyncLoading] that still holds
+/// the previous feed, and `whenData` drops that value: the screen then saw a
+/// bare loading state, swapped the whole grid for a spinner and back, and
+/// re-created every tile (and its Scrollable) on each finished upload batch.
+/// The previous feed's groups are kept through the reload instead.
 final galleryMonthGroupsProvider =
-    Provider<AsyncValue<List<GalleryMonthGroup>>>(
-      (ref) => ref.watch(galleryFeedProvider).whenData(groupEntriesByMonth),
-    );
+    Provider<AsyncValue<List<GalleryMonthGroup>>>((ref) {
+      final feed = ref.watch(galleryFeedProvider);
+      final previous = feed.valueOrNull;
+      if (feed is AsyncLoading && previous != null) {
+        return AsyncLoading<List<GalleryMonthGroup>>().copyWithPrevious(
+          AsyncData(groupEntriesByMonth(previous)),
+          isRefresh: false,
+        );
+      }
+      return feed.whenData(groupEntriesByMonth);
+    });

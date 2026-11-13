@@ -10,6 +10,7 @@ import '../backup/providers/backup_provider.dart';
 import '../explorer/providers/index_provider.dart';
 import '../explorer/screens/explorer_screen.dart';
 import '../gallery/screens/gallery_screen.dart';
+import '../profile/providers/maintenance_provider.dart';
 import '../profile/providers/profile_provider.dart';
 import 'scroll_to_top.dart';
 
@@ -109,6 +110,8 @@ class _MainShellState extends ConsumerState<MainShell>
     _aliveTimer = Timer.periodic(_aliveInterval, (_) => _markAlive());
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await ref.read(indexProvider.notifier).load();
+      // Automatic maintenance (thumbnail packs, capture dates) once synced.
+      ref.read(autoMaintenanceBindingProvider);
       await ref.read(backupProvider.notifier).initRegistry();
 
       // These next two BOTH put system UI in front of the app on a fresh

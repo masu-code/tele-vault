@@ -4,11 +4,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/backup/backup_registry.dart';
 import '../../../core/format_utils.dart';
 import '../../archive/screens/archive_screen.dart';
+import '../../auth/providers/auth_provider.dart';
 import '../../backup/providers/backup_provider.dart';
 import '../../explorer/providers/index_provider.dart';
 import '../../transfer/widgets/transfer_progress_bar.dart';
+import '../providers/maintenance_provider.dart';
 import '../providers/profile_provider.dart';
-import 'backfill_screen.dart';
 import 'free_up_storage_screen.dart';
 
 /// Bottom sheet shown when tapping the profile avatar: Telegram account
@@ -67,12 +68,13 @@ class AccountSheet extends ConsumerWidget {
             const _StorageCard(),
             const SizedBox(height: 12),
             _ArchivedButton(),
-            const SizedBox(height: 12),
-            const _BackfillButton(),
+            const _MaintenanceStatusLine(),
             const SizedBox(height: 12),
             const _MobileDataToggle(),
             const SizedBox(height: 8),
             const _HeadlessStatus(),
+            const SizedBox(height: 12),
+            const LogOutButton(),
           ],
         ),
       ),
@@ -204,29 +206,28 @@ class _ArchivedButton extends ConsumerWidget {
   }
 }
 
-/// Entry point to [BackfillScreen] (thumbnails for old cloud items).
-class _BackfillButton extends StatelessWidget {
-  const _BackfillButton();
+/// Read-only line shown while the automatic maintenance (thumbnail packs,
+/// capture dates, thumbnails for old items) is running. Nothing to press:
+/// the app finds that work and does it by itself.
+class _MaintenanceStatusLine extends ConsumerWidget {
+  const _MaintenanceStatusLine();
 
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xFF1C1C1E),
-        borderRadius: BorderRadius.circular(14),
-      ),
-      child: ListTile(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-        leading: const Icon(Icons.photo_library_outlined, color: Color(0xFF2AABEE)),
-        title: const Text('Thumbnail backfill'),
-        trailing: const Icon(Icons.chevron_right, color: Colors.white38),
-        onTap: () {
-          Navigator.pop(context);
-          Navigator.of(context).push(
-            MaterialPageRoute(builder: (_) => const BackfillScreen()),
-          );
-        },
-      ),
+  Widget build(BuildContext context, WidgetRef ref) {
+    final service = ref.watch(autoMaintenanceProvider);
+    return ValueListenableBuilder(
+      valueListenable: service.status,
+      builder: (context, status, _) {
+        if (!status.running) return const SizedBox.shrink();
+        final count = status.handled > 0 ? ' (${status.handled})' : '';
+        return Padding(
+          padding: const EdgeInsets.only(top: 12, left: 4, right: 4),
+          child: Text(
+            'Optimizando miniaturas y fechas…$count',
+            style: const TextStyle(color: Colors.white54, fontSize: 12),
+          ),
+        );
+      },
     );
   }
 }
@@ -301,6 +302,78 @@ class _MobileDataToggle extends ConsumerWidget {
             onChanged: (v) => ref.read(backupProvider.notifier).setAllowMobileData(v),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Ends the Telegram session on this device (and server-side, best effort)
+/// after a confirmation. See [AuthNotifier.logOut]: the backup stops until the
+/// next login, the files in Telegram are not touched.
+class LogOutButton extends ConsumerStatefulWidget {
+  const LogOutButton({super.key});
+
+  static const title = 'Log out';
+  static const confirmTitle = 'Log out of TeleVault?';
+  static const confirmBody =
+      'Automatic backup stops until you sign in again. Your files in '
+      'Telegram are not touched.';
+
+  @override
+  ConsumerState<LogOutButton> createState() => _LogOutButtonState();
+}
+
+class _LogOutButtonState extends ConsumerState<LogOutButton> {
+  bool _busy = false;
+
+  Future<void> _logOut() async {
+    // Read before awaiting: this sheet is torn down while the log out runs.
+    final auth = ref.read(authProvider.notifier);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(LogOutButton.confirmTitle),
+        content: const Text(LogOutButton.confirmBody),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Log out', style: TextStyle(color: Colors.redAccent)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      // On completion the auth state flips and the app pops back to the
+      // login screen (see TeleVaultApp).
+      await auth.logOut();
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFF1C1C1E),
+      borderRadius: BorderRadius.circular(14),
+      child: ListTile(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        leading: _busy
+            ? const SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.logout, color: Colors.redAccent),
+        title: Text(_busy ? 'Logging out…' : LogOutButton.title),
+        enabled: !_busy,
+        onTap: _logOut,
       ),
     );
   }

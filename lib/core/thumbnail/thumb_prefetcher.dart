@@ -560,7 +560,8 @@ class ThumbPrefetcher {
       List<ServerThumbResult> results = const [];
       try {
         results = await _serverThumbs([
-          for (final r in batch) ServerThumbTarget(r.key, _firstMessageId(r.file!)),
+          for (final r in batch)
+            ServerThumbTarget(r.key, _firstMessageId(r.file!), priority: _isRequested(r.key)),
         ]);
       } catch (_) {
         // every key below fails with backoff

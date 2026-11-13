@@ -32,11 +32,11 @@ Widget _harness({
     home: Scaffold(
       body: ViewerChromeHost(
         // A plain colored box, not a real Video widget — CloudVideoPage /
-        // LocalVideoPage don't wrap this in an InteractiveViewer anymore
-        // (that's the actual fix under test: InteractiveViewer's scale
-        // recognizer used to win the gesture arena over this widget's own
-        // vertical drag regardless of panEnabled), so nothing here should
-        // either.
+        // LocalVideoPage have no zoom/scale recognizer (an InteractiveViewer
+        // there used to win the gesture arena over this widget's own vertical
+        // drag regardless of panEnabled), so nothing here should either.
+        // Photo pages (PhotoView inside a PageView) are covered end to end
+        // in photo_zoom_test.dart.
         child: child ?? Container(color: Colors.black),
         descriptor: ValueNotifier(
           ViewerChromeDescriptor(
@@ -428,6 +428,43 @@ void main() {
       expect(states, [true, false]);
       await first.up();
       await second.up();
+    },
+  );
+
+  testWidgets(
+    'a second finger mid swipe-down puts the half-dragged viewer back instead '
+        'of leaving it stranded, and does not dismiss',
+    (tester) async {
+      var backCalled = false;
+      await tester.pumpWidget(_harness(onBack: () => backCalled = true));
+      double dismissOffset() => tester
+          .widget<Transform>(
+            find
+                .descendant(
+                  of: find.byType(ViewerChromeHost),
+                  matching: find.byType(Transform),
+                )
+                .first,
+          )
+          .transform
+          .getTranslation()
+          .y;
+
+      final first = await tester.startGesture(const Offset(400, 100));
+      await first.moveBy(const Offset(0, 20));
+      await first.moveBy(const Offset(0, 150));
+      await tester.pump();
+      expect(dismissOffset(), greaterThan(100));
+
+      final second = await tester.startGesture(const Offset(420, 300));
+      await first.moveBy(const Offset(0, -30));
+      await second.moveBy(const Offset(0, 30));
+      await first.up();
+      await second.up();
+      await tester.pumpAndSettle();
+
+      expect(dismissOffset(), 0);
+      expect(backCalled, isFalse);
     },
   );
 }

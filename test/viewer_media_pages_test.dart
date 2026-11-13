@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:photo_view/photo_view.dart';
 import 'package:tele_vault/features/preview/widgets/media_pages.dart';
 import 'package:tele_vault/features/preview/widgets/photo_zoom_controller.dart';
 import 'package:tele_vault/features/preview/widgets/viewer_page_chrome.dart';
@@ -111,20 +112,46 @@ void main() {
     );
     expect(zoom.highRes.value, isFalse);
 
-    zoom.transform.value = Matrix4.diagonal3Values(1.4, 1.4, 1);
+    // photo_view reports scale changes through a stream: pump to deliver.
+    Future<void> setScale(double scale) async {
+      zoom.view.scale = scale;
+      await tester.pump();
+    }
+
+    await setScale(1.4);
     expect(zoom.zoomed.value, isTrue);
     expect(zoom.highRes.value, isFalse);
 
-    zoom.transform.value = Matrix4.diagonal3Values(1.6, 1.6, 1);
+    await setScale(1.6);
     expect(zoom.highRes.value, isTrue);
 
     // Pinching back below the on-threshold does not swap straight back.
-    zoom.transform.value = Matrix4.diagonal3Values(1.2, 1.2, 1);
+    await setScale(1.2);
     expect(zoom.highRes.value, isTrue);
 
-    zoom.transform.value = Matrix4.identity();
+    await setScale(1.0);
     expect(zoom.zoomed.value, isFalse);
     expect(zoom.highRes.value, isFalse);
+  });
+
+  testWidgets('PhotoZoomController also sees photo_view\'s "invisible" scale '
+      'updates (its snap-back animations use them)', (tester) async {
+    late PhotoZoomController zoom;
+    await tester.pumpWidget(_ZoomOwner(onCreate: (z) => zoom = z));
+    zoom.view.setScaleInvisibly(2);
+    await tester.pump();
+    expect(zoom.zoomed.value, isTrue);
+    zoom.view.setScaleInvisibly(1);
+    await tester.pump();
+    expect(zoom.zoomed.value, isFalse);
+  });
+
+  testWidgets('the double-tap cycle never changes photo_view\'s scale state', (
+    tester,
+  ) async {
+    for (final s in PhotoViewScaleState.values) {
+      expect(PhotoZoomController.noDoubleTapCycle(s), s);
+    }
   });
 }
 

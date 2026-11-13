@@ -8,6 +8,7 @@ import 'package:photo_manager/photo_manager.dart';
 import 'package:share_plus/share_plus.dart';
 import '../../../core/backup/asset_upload_service.dart';
 import '../../../core/backup/device_state_bus.dart';
+import '../../../core/diag/tv_stats.dart';
 import '../../../core/download/download_service.dart';
 import '../../backup/providers/backup_provider.dart';
 import '../../download/providers/download_provider.dart';
@@ -53,6 +54,14 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen>
   List<GalleryEntry>? _cachedFlat;
   double? _cachedTopInset;
   bool? _cachedBanner;
+
+  /// Slivers of each month section and the tile of each entry, by instance
+  /// (see [_slivers]). Weak: they go with the feed that held them.
+  final Expando<List<Widget>> _groupSlivers = Expando();
+  final Expando<Widget> _tiles = Expando();
+
+  /// The current flat feed, read by a tile's tap at tap time.
+  List<GalleryEntry> _flat = const [];
 
   /// Whether this device has granted (full or limited) photo library access.
   /// Null while the initial passive check is in flight; false shows the
@@ -297,6 +306,7 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen>
     final feedAsync = ref.watch(galleryFeedProvider);
     final groupsAsync = ref.watch(galleryMonthGroupsProvider);
     final flat = feedAsync.valueOrNull ?? const <GalleryEntry>[];
+    _flat = flat;
 
     ref.listen(scrollToTopProvider, (prev, next) {
       if (next != null && next.tabIndex == 0) _scrollToTop();
@@ -429,6 +439,12 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen>
   /// top inset or the permission banner changes: a screen rebuild for any other
   /// reason (selection mode, permission state) reuses the same widget instances,
   /// which Flutter skips, instead of re-running every visible tile's builder.
+  ///
+  /// When the feed did change, each month's slivers are reused as long as its
+  /// [GalleryMonthGroup] instance is (see [groupEntriesByMonth]), and each
+  /// tile widget as long as its [GalleryEntry] instance is (see [adoptFeed]):
+  /// an upload batch then rebuilds only the tiles that gained a cloud badge,
+  /// not every tile on screen.
   List<Widget> _slivers(
     BuildContext context,
     List<GalleryMonthGroup> groups,
@@ -444,98 +460,105 @@ class _GalleryScreenState extends ConsumerState<GalleryScreen>
         _cachedBanner == banner) {
       return cached;
     }
-    var index = 0; // running position in the flat list, for tap-to-open
+    TvStats.screenBuild('gallery-slivers');
     final slivers = <Widget>[
       SliverToBoxAdapter(child: SizedBox(height: topInset)),
       if (banner) SliverToBoxAdapter(child: _permissionBanner()),
+      for (final group in groups)
+        ...(_groupSlivers[group] ??= _monthSlivers(group)),
     ];
-    for (final group in groups) {
-      final startIndex = index;
-      // Keyed by month so a feed rebuild (every upload bumps
-      // deviceStateVersion, which recomputes the whole feed) re-attaches
-      // each sliver to the same month rather than to whatever now sits
-      // at that position. Without keys, one new month at the top shifts
-      // every sliver by two and the framework matches them by position.
-      slivers.add(
-        SliverPadding(
-          key: ValueKey('header-${group.month.toIso8601String()}'),
-          padding: const EdgeInsets.fromLTRB(12, 20, 12, 10),
-          sliver: SliverToBoxAdapter(
-            child: Text(
-              monthHeaderLabel(group.month, DateTime.now().year),
-              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
-            ),
-          ),
-        ),
-      );
-      // Captured per group so findChildIndexCallback below closes over
-      // the right list. The lookup map is built at most once per group
-      // per rebuild, and only if the sliver actually asks — a linear
-      // scan per child would be O(children × entries) on every upload.
-      final entries = group.entries;
-      Map<String, int>? indexByKey;
-      slivers.add(
-        SliverPadding(
-          key: ValueKey('grid-${group.month.toIso8601String()}'),
-          padding: const EdgeInsets.symmetric(horizontal: 2),
-          sliver: SliverGrid(
-            gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-              maxCrossAxisExtent: 120,
-              crossAxisSpacing: 2,
-              mainAxisSpacing: 2,
-            ),
-            delegate: SliverChildBuilderDelegate(
-              (context, i) {
-                final entry = entries[i];
-                final flatIndex = startIndex + i;
-                return SelectionScopedTile(
-                  key: ValueKey(entry.key),
-                  entry: entry,
-                  selection: _selection,
-                  onLongPress: () => _selection.value.isNotEmpty
-                      ? _toggle(entry)
-                      : _startSelection(entry),
-                  onTap: () {
-                    if (_selection.value.isNotEmpty) {
-                      _toggle(entry);
-                    } else {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) => MixedMediaViewerScreen(
-                            entries: flat,
-                            initialIndex: flatIndex,
-                          ),
-                        ),
-                      );
-                    }
-                  },
-                );
-              },
-              childCount: entries.length,
-              // New photos land at the FRONT of the newest month, so
-              // every already-built tile shifts index on each upload.
-              // Without this the sliver can't match a keyed child to its
-              // new index, so it throws the element away and rebuilds it
-              // from scratch — which is what made an upload land as a
-              // visible lurch in the grid instead of a quiet insert.
-              findChildIndexCallback: (Key key) {
-                if (key is! ValueKey<String>) return null;
-                final map = indexByKey ??= {
-                  for (var i = 0; i < entries.length; i++) entries[i].key: i,
-                };
-                return map[key.value];
-              },
-            ),
-          ),
-        ),
-      );
-      index += group.entries.length;
-    }
     _cachedGroups = groups;
     _cachedFlat = flat;
     _cachedTopInset = topInset;
     _cachedBanner = banner;
     return _sliverCache = slivers;
+  }
+
+  /// Header and grid of one month section, cached in [_groupSlivers] for as
+  /// long as [group] is the current instance of that month.
+  List<Widget> _monthSlivers(GalleryMonthGroup group) {
+    TvStats.screenBuild('gallery-month');
+    // Captured per group so findChildIndexCallback below closes over
+    // the right list. The lookup map is built at most once per group
+    // instance, and only if the sliver actually asks — a linear
+    // scan per child would be O(children × entries) on every upload.
+    final entries = group.entries;
+    Map<String, int>? indexByKey;
+    return [
+      // Keyed by month so a feed rebuild re-attaches each sliver to the same
+      // month rather than to whatever now sits at that position. Without
+      // keys, one new month at the top shifts every sliver by two and the
+      // framework matches them by position.
+      SliverPadding(
+        key: ValueKey('header-${group.month.toIso8601String()}'),
+        padding: const EdgeInsets.fromLTRB(12, 20, 12, 10),
+        sliver: SliverToBoxAdapter(
+          child: Text(
+            monthHeaderLabel(group.month, DateTime.now().year),
+            style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
+          ),
+        ),
+      ),
+      SliverPadding(
+        key: ValueKey('grid-${group.month.toIso8601String()}'),
+        padding: const EdgeInsets.symmetric(horizontal: 2),
+        sliver: SliverGrid(
+          gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+            maxCrossAxisExtent: 120,
+            crossAxisSpacing: 2,
+            mainAxisSpacing: 2,
+          ),
+          delegate: SliverChildBuilderDelegate(
+            (context, i) => _tile(entries[i]),
+            childCount: entries.length,
+            // New photos land at the FRONT of the newest month, so
+            // every already-built tile shifts index on each upload.
+            // Without this the sliver can't match a keyed child to its
+            // new index, so it throws the element away and rebuilds it
+            // from scratch — which is what made an upload land as a
+            // visible lurch in the grid instead of a quiet insert.
+            findChildIndexCallback: (Key key) {
+              if (key is! ValueKey<String>) return null;
+              final map = indexByKey ??= {
+                for (var i = 0; i < entries.length; i++) entries[i].key: i,
+              };
+              return map[key.value];
+            },
+          ),
+        ),
+      ),
+    ];
+  }
+
+  /// The tile of [entry], one widget instance per entry instance: a month
+  /// grid rebuilt because another of its entries changed hands Flutter the
+  /// identical widget for this one, which it skips.
+  Widget _tile(GalleryEntry entry) => _tiles[entry] ??= SelectionScopedTile(
+    key: ValueKey(entry.key),
+    entry: entry,
+    selection: _selection,
+    onLongPress: () =>
+        _selection.value.isNotEmpty ? _toggle(entry) : _startSelection(entry),
+    onTap: () => _open(entry),
+  );
+
+  void _open(GalleryEntry entry) {
+    if (_selection.value.isNotEmpty) {
+      _toggle(entry);
+      return;
+    }
+    // Looked up at tap time: the cached tile outlives feed rebuilds that
+    // shift its position in the flat list.
+    final flat = _flat;
+    var index = flat.indexOf(entry);
+    if (index < 0) index = flat.indexWhere((e) => e.key == entry.key);
+    if (index < 0) return;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) =>
+            MixedMediaViewerScreen(entries: flat, initialIndex: index),
+      ),
+    );
   }
 
   Widget _permissionBanner() {

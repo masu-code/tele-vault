@@ -53,6 +53,7 @@ class _GalleryTileState extends State<GalleryTile> {
   @override
   void initState() {
     super.initState();
+    TvStats.tileInit();
     _track(widget.entry);
   }
 

@@ -83,14 +83,12 @@ section p.sub { margin: 0 0 28px; color: var(--muted); max-width: 640px; }
 
 .shots { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
 .shot {
-  aspect-ratio: 9 / 19; border-radius: 22px; background: var(--surface);
-  border: 1px dashed var(--border); display: grid; place-items: center; text-align: center;
-  color: var(--muted); font-size: 14px; padding: 16px; overflow: hidden;
+  aspect-ratio: 9 / 20; border-radius: 22px; background: var(--surface);
+  border: 1px solid var(--border); display: grid; place-items: center; text-align: center;
+  color: var(--muted); font-size: 14px; padding: 0; overflow: hidden;
 }
 .shot img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .shot small { display: block; margin-top: 4px; opacity: .7; }
-/* TODO: replace each placeholder .shot content with
-   <img src="screenshots/NAME.png" alt="..." loading="lazy"> once the screenshots exist. */
 
 .note {
   background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--primary);
@@ -216,16 +214,12 @@ footer p { margin: 14px 0 0; max-width: 760px; }
 
     <section id="screenshots">
       <h2>Screenshots</h2>
-      <p class="sub">Taken from a synthetic gallery, never from a real library.</p>
+      <p class="sub">Taken from a demo library of free sample photos, never from a real library.</p>
       <div class="shots">
-        <!-- TODO: docs/screenshots/gallery.png -->
-        <figure class="shot" style="margin:0"><div>Gallery<small>docs/screenshots/gallery.png</small></div></figure>
-        <!-- TODO: docs/screenshots/viewer.png -->
-        <figure class="shot" style="margin:0"><div>Viewer<small>docs/screenshots/viewer.png</small></div></figure>
-        <!-- TODO: docs/screenshots/albums.png -->
-        <figure class="shot" style="margin:0"><div>Albums<small>docs/screenshots/albums.png</small></div></figure>
-        <!-- TODO: docs/screenshots/backup.png -->
-        <figure class="shot" style="margin:0"><div>Backup<small>docs/screenshots/backup.png</small></div></figure>
+        <figure class="shot" style="margin:0"><img src="screenshots/gallery.png" width="1080" height="2400" alt="TeleVault gallery: one timeline of phone and cloud photos grouped by month, with a cloud badge on backed-up items and play icons on videos" loading="lazy"></figure>
+        <figure class="shot" style="margin:0"><img src="screenshots/viewer.png" width="1080" height="2400" alt="TeleVault full-screen photo viewer with share, uploaded, download, add to album, archive and delete actions" loading="lazy"></figure>
+        <figure class="shot" style="margin:0"><img src="screenshots/albums.png" width="1080" height="2400" alt="TeleVault albums: a grid of albums with cover photos and item counts" loading="lazy"></figure>
+        <figure class="shot" style="margin:0"><img src="screenshots/backup.png" width="1080" height="2400" alt="TeleVault account sheet with a backup upload in progress, device storage use and background backup status" loading="lazy"></figure>
       </div>
     </section>
 

@@ -37,15 +37,17 @@ class GalleryFeedService {
     // from uploading/downloading *existing* assets, which never change the
     // device's asset count, so they cost one count query, not a re-scan.
     final assets = await DeviceLibrary.instance.all();
-    final next = mergeFeed(
-      assets: assets,
-      index: index,
-      fileItemIdFor: BackupRegistry.instance.fileItemIdFor,
+    return _adopt(
+      mergeFeed(
+        assets: assets,
+        index: index,
+        fileItemIdFor: BackupRegistry.instance.fileItemIdFor,
+      ),
     );
-    final previous = _previous;
-    if (previous != null && sameFeed(previous, next)) return previous;
-    return _previous = next;
   }
+
+  List<GalleryEntry> _adopt(List<GalleryEntry> next) =>
+      _previous = adoptFeed(_previous, next);
 
   /// Forces the next [buildEntries] call to re-scan the device instead of
   /// using the cached asset list (e.g. after a pull-to-refresh).
@@ -53,9 +55,106 @@ class GalleryFeedService {
 
   // Re-sorted by the entries' own date: mediaFiles is ordered by upload
   // time, which is not the key the month sections group by.
-  List<GalleryEntry> _cloudOnly(FileIndex index) => sortNewestFirst([
-    for (final f in index.mediaFiles) GalleryEntry(fileItem: f),
-  ]);
+  List<GalleryEntry> _cloudOnly(FileIndex index) => _adopt(
+    sortNewestFirst([
+      for (final f in index.mediaFiles) GalleryEntry(fileItem: f),
+    ]),
+  );
+}
+
+/// [next] with every entry that shows the same thing as one in [previous]
+/// replaced by that previous instance; [previous] itself when that leaves
+/// nothing different (see [sameFeed]).
+///
+/// Every index write (each upload batch, the capture-date stamp, an index
+/// re-read after another writer's change) hands the merge new [FileItem]
+/// instances, and a re-scan new [AssetEntity] ones. Compared by identity,
+/// every entry then looked changed and the whole grid was rebuilt for what is
+/// usually a handful of new cloud badges. "The same" here is value equality
+/// (see [sameEntry]), so a kept entry never carries stale data to the viewer,
+/// the selection actions or the capture-date stamper.
+List<GalleryEntry> adoptFeed(
+  List<GalleryEntry>? previous,
+  List<GalleryEntry> next,
+) {
+  if (previous == null || previous.isEmpty) return next;
+  final byKey = <String, GalleryEntry>{for (final e in previous) e.key: e};
+  final out = List<GalleryEntry>.of(next, growable: false);
+  var unchanged = previous.length == next.length;
+  for (var i = 0; i < out.length; i++) {
+    final old = byKey[out[i].key];
+    if (old != null && sameEntry(old, out[i])) out[i] = old;
+    if (unchanged && !identical(out[i], previous[i])) unchanged = false;
+  }
+  return unchanged ? previous : out;
+}
+
+/// True when [a] and [b] show the same thing: same key, same date and thumb
+/// key, the same device asset (id and modified time, as in [sameFeed]) and a
+/// value-equal cloud item (see [sameFileItem]).
+bool sameEntry(GalleryEntry a, GalleryEntry b) {
+  if (identical(a, b)) return true;
+  if (a.key != b.key ||
+      a.effectiveDateMs != b.effectiveDateMs ||
+      a.thumbKey != b.thumbKey) {
+    return false;
+  }
+  final xa = a.asset, ya = b.asset;
+  if (!identical(xa, ya) &&
+      (xa == null ||
+          ya == null ||
+          xa.id != ya.id ||
+          xa.modifiedDateSecond != ya.modifiedDateSecond)) {
+    return false;
+  }
+  final xf = a.fileItem, yf = b.fileItem;
+  if (identical(xf, yf)) return true;
+  return xf != null && yf != null && sameFileItem(xf, yf);
+}
+
+/// Field-by-field equality of two [FileItem]s (they have no `==`), including
+/// the parts and the preserved unknown JSON keys.
+bool sameFileItem(FileItem a, FileItem b) {
+  if (identical(a, b)) return true;
+  if (a.id != b.id ||
+      a.name != b.name ||
+      a.folderId != b.folderId ||
+      a.totalSize != b.totalSize ||
+      a.mimeType != b.mimeType ||
+      a.createdAt != b.createdAt ||
+      a.archived != b.archived ||
+      a.preview != b.preview ||
+      a.parts.length != b.parts.length ||
+      !_jsonEquals(a.extra, b.extra)) {
+    return false;
+  }
+  for (var i = 0; i < a.parts.length; i++) {
+    final p = a.parts[i], q = b.parts[i];
+    if (p.messageId != q.messageId || p.part != q.part || p.size != q.size) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Deep equality of decoded-JSON values (maps, lists, scalars).
+bool _jsonEquals(Object? a, Object? b) {
+  if (identical(a, b)) return true;
+  if (a is Map && b is Map) {
+    if (a.length != b.length) return false;
+    for (final key in a.keys) {
+      if (!b.containsKey(key) || !_jsonEquals(a[key], b[key])) return false;
+    }
+    return true;
+  }
+  if (a is List && b is List) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (!_jsonEquals(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  return a == b;
 }
 
 /// True when [a] and [b] show exactly the same entries in the same order, so

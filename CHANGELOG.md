@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-13
+
+### Added
+- Log out from the account sheet. It ends the session on Telegram, clears local session data and keeps the upload registry for the same account.
+- The app detects a session revoked from another device and returns to sign-in.
+- Automatic background maintenance, with no manual buttons:
+  - thumbnail packs are built from local thumbnails on Wi-Fi, with coverage read from existing packs so nothing is packed twice;
+  - capture dates are recovered from EXIF and MP4 metadata;
+  - old items without thumbnails are backfilled on Wi-Fi while charging.
+- A read-only maintenance status line in the account sheet.
+- Fullscreen toggle and tap-to-seek in the video player.
+- Demo-mode screenshots in the README and on the landing page.
+
+### Changed
+- Pinch-to-zoom now uses `photo_view`. It works at any finger angle, and the photo can be zoomed while the full-resolution image is still loading.
+- Telegram requests are paced adaptively: a shared flood gate, and an adaptive number of concurrent thumbnail downloads, with visible tiles first.
+- Videos are decoded in hardware (`mediacodec-copy`, with an automatic fallback).
+- Larger month titles in the gallery; Telegram-blue seek bar with a larger touch area.
+- New app icon and the app name "TeleVault".
+
+### Fixed
+- The gallery no longer rebuilds every tile when an upload finishes.
+- Long videos failing on the first open: file references are refreshed, a timeout retries once, and concurrent downloads of the same file are shared.
+- Photos reordering after "Free up space": the capture date is stored before any device copy is deleted.
+- Gallery sections now group by the date a photo was taken, not the upload date.
+- Local index backups keep one per day for the last 7 days.
+
 ## [0.9.0] - 2026-11-12
 
 First public pre-release.

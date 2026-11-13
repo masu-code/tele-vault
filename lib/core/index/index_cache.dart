@@ -47,7 +47,8 @@ class CachedIndex {
 ///   instead of being trusted as "remote document X";
 /// - `index_backups/<utc>-<tag>.json`: what was stored remotely before each
 ///   write (and `<utc>-<tag>-unsaved.json`: the bytes of a write that
-///   failed), newest [keepBackups] kept.
+///   failed), newest [keepBackups] kept plus the oldest of each of the last
+///   [keepDays] days.
 ///
 /// Every file is written to a temp name and renamed into place, so a reader
 /// (or a crash) never sees a torn file. Reads, CRC and JSON decoding run in
@@ -61,6 +62,10 @@ class IndexCache {
   IndexCache.inDirectory(Directory dir) : _resolveDir = (() async => dir);
 
   static const int keepBackups = 20;
+
+  /// Besides the newest [keepBackups], the oldest backup of each of the last
+  /// this many calendar days is kept.
+  static const int keepDays = 7;
   static const String cacheName = 'index_cache.json';
   static const String metaName = 'index_cache.meta';
   static const String backupDirName = 'index_backups';
@@ -109,6 +114,21 @@ class IndexCache {
         ));
   }
 
+  /// Deletes the cached index and its meta (log out: the next account must
+  /// not be served this one's index). `index_backups/` is kept on purpose:
+  /// it is the recovery copy of what was stored remotely. Never throws.
+  Future<void> clear() async {
+    try {
+      final root = await _root();
+      for (final name in [metaName, cacheName]) {
+        final f = File(p.join(root, name));
+        try {
+          if (await f.exists()) await f.delete();
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
   /// Writes [bytes] to `index_backups/<utc>[-label].json` and prunes old
   /// backups. Throws when the backup could not be written: the caller must
   /// not overwrite the remote index without it.
@@ -148,10 +168,9 @@ class IndexCache {
 
   Future<void> _prune(Directory dir) async {
     final files = await listBackups();
-    final excess = files.length - keepBackups;
-    for (var i = 0; i < excess; i++) {
+    for (final f in backupsToDelete(files.map((f) => p.basename(f.path)).toList())) {
       try {
-        await files[i].delete();
+        await File(p.join(dir.path, f)).delete();
       } catch (_) {
         // Another writer (headless engine) pruned it first.
       }
@@ -165,6 +184,31 @@ class IndexCache {
         }
       }
     } catch (_) {}
+  }
+
+  /// Which of [namesOldestFirst] (backup file names, sorted) to delete: keeps
+  /// the newest [keepBackups] plus the oldest backup of each of the last
+  /// [keepDays] calendar days (UTC, counted from the newest backup), so a night
+  /// of unattended saves never rotates out the previous days' copies.
+  @visibleForTesting
+  static List<String> backupsToDelete(List<String> namesOldestFirst) {
+    final names = [...namesOldestFirst]..sort();
+    if (names.isEmpty) return const [];
+    final keep = <String>{...names.skip(max(0, names.length - keepBackups))};
+    // Name starts with `yyyymmddT...`; the day is its first 8 characters.
+    String day(String n) => n.length >= 8 ? n.substring(0, 8) : n;
+    final newest = names.last;
+    final newestDay = DateTime.tryParse(day(newest));
+    final firstOfDay = <String, String>{};
+    for (final n in names) {
+      firstOfDay.putIfAbsent(day(n), () => n);
+    }
+    for (final e in firstOfDay.entries) {
+      final d = DateTime.tryParse(e.key);
+      if (newestDay == null || d == null) continue;
+      if (newestDay.difference(d).inDays < keepDays) keep.add(e.value);
+    }
+    return [for (final n in names) if (!keep.contains(n)) n];
   }
 
   String _tmpSuffix() =>

@@ -8,7 +8,11 @@ import 'package:workmanager/workmanager.dart';
 import '../device/device_library.dart';
 import '../../models/file_item.dart';
 import '../index/index_service.dart';
+import '../metadata/capture_date_recovery.dart';
 import '../telegram/client.dart';
+import '../thumbnail/auto_maintenance_service.dart';
+import '../thumbnail/auto_pack_service.dart';
+import '../thumbnail/backfill_service.dart';
 import '../upload/upload_service.dart';
 import 'backup_registry.dart';
 import 'connectivity_gate.dart';
@@ -24,6 +28,16 @@ const uploadSyncTaskName = 'televault-upload-sync';
 /// progress notification, shown only when there is real work.
 const uploadRunTaskName = 'televault-upload-run';
 
+/// Unique name (and task name) of the periodic MAINTENANCE task: thumbnail
+/// packs, capture dates and the thumbnail backfill of old items, which
+/// downloads originals. WorkManager only starts it on an unmetered network
+/// while the device is charging.
+const maintenanceTaskName = 'televault-maintenance';
+
+/// Backfill chunks of [AutoMaintenanceService.backfillChunk] items one
+/// maintenance task may run (each chunk is saved before the next starts).
+const maintenanceBackfillChunks = 20;
+
 /// How long one foreground run may keep starting new uploads.
 ///
 /// The run is a foreground service ([headlessForegroundConfig]), so it is not
@@ -37,11 +51,12 @@ const headlessRunBudget = Duration(minutes: 45);
 const inlineRunBudget = Duration(minutes: 8);
 
 /// Which job [callbackDispatcher] runs for a WorkManager task name.
-enum HeadlessJob { check, uploadRun, unknown }
+enum HeadlessJob { check, uploadRun, maintenance, unknown }
 
 HeadlessJob headlessJobFor(String task) => switch (task) {
       uploadSyncTaskName => HeadlessJob.check,
       uploadRunTaskName => HeadlessJob.uploadRun,
+      maintenanceTaskName => HeadlessJob.maintenance,
       _ => HeadlessJob.unknown,
     };
 
@@ -76,6 +91,41 @@ Future<void> _scheduleForegroundRun() => Workmanager().registerOneOffTask(
       existingWorkPolicy: ExistingWorkPolicy.keep,
       foregroundServiceConfig: headlessForegroundConfig(),
     );
+
+/// Registers the periodic CHECK (Android only; WorkManager is already
+/// initialized by `main`). `update` (not `keep`) so the registered spec always
+/// matches this code; it keeps the existing schedule and never cancels a
+/// running run. Called at start-up when a session exists and after a login.
+Future<void> scheduleHeadlessSync() async {
+  if (!Platform.isAndroid) return;
+  await Workmanager().registerPeriodicTask(
+    uploadSyncTaskName,
+    uploadSyncTaskName,
+    frequency: const Duration(minutes: 15),
+    constraints: Constraints(networkType: NetworkType.connected),
+    existingWorkPolicy: ExistingPeriodicWorkPolicy.update,
+  );
+  await Workmanager().registerPeriodicTask(
+    maintenanceTaskName,
+    maintenanceTaskName,
+    frequency: const Duration(minutes: 30),
+    constraints: Constraints(networkType: NetworkType.unmetered, requiresCharging: true),
+    existingWorkPolicy: ExistingPeriodicWorkPolicy.update,
+  );
+}
+
+/// Log out: cancels the periodic check and any queued or running foreground
+/// run (both unique names). Best effort per task; nothing on other platforms.
+Future<void> cancelHeadlessSync() async {
+  if (!Platform.isAndroid) return;
+  for (final name in const [uploadSyncTaskName, uploadRunTaskName, maintenanceTaskName]) {
+    try {
+      await Workmanager().cancelByUniqueName(name);
+    } catch (e) {
+      debugPrint('TVBG: could not cancel a background task (${e.runtimeType})');
+    }
+  }
+}
 
 /// Uploads are written to the index in batches of this many files, or after
 /// [headlessFlushAfter] with anything pending, so a run that is stopped early
@@ -146,6 +196,7 @@ const _stopFlushTimeout = Duration(seconds: 30);
 /// WorkManager stopped the running task (timeout, quota, constraints...):
 /// write what was uploaded but not yet flushed, and stop starting uploads.
 Future<void> _onTaskStopped(String task, StopReason reason) async {
+  _activeMaintenance?.stop();
   final run = _activeRun;
   if (run == null) return;
   run.stopRequested = true;
@@ -220,6 +271,61 @@ Future<void> runHeadlessSync() async {
   final pending = await _pendingIfDue(registry, done);
   if (pending == null) return;
   await _runUploads(registry, done, pending.assets, headlessRunBudget);
+  // Right after its uploads: pack the new thumbnails and recover dates (no
+  // backfill here: charging is not known in this task). Its failure must not
+  // replace the upload status recorded above.
+  try {
+    await runHeadlessMaintenance(charging: false, afterUploads: true);
+  } catch (e) {
+    debugPrint('TVBG: maintenance failed (${e.runtimeType})');
+  }
+}
+
+/// The maintenance job running in this engine, for the stop signal.
+AutoMaintenanceService? _activeMaintenance;
+
+/// Automatic maintenance in a headless engine: thumbnail packs and capture
+/// dates on an unmetered network, plus backfill chunks when [charging] (the
+/// [maintenanceTaskName] task, whose constraints guarantee it). Skipped while
+/// the app is alive (it runs its own) and when another job holds the lock.
+/// Logs counts only.
+Future<void> runHeadlessMaintenance({required bool charging, bool afterUploads = false}) async {
+  final registry = BackupRegistry.instance;
+  await registry.init();
+  await registry.reload();
+  if (registry.appRecentlyAlive) {
+    debugPrint('TVBG: maintenance skipped — app is running');
+    return;
+  }
+  if (!afterUploads && !await TelegramService.instance.restoreSession()) {
+    debugPrint('TVBG: maintenance skipped — no session to restore');
+    return;
+  }
+  final index = IndexServiceAccess(IndexService.instance);
+  if (!await index.load()) {
+    debugPrint('TVBG: maintenance skipped — index not loaded');
+    return;
+  }
+  final service = AutoMaintenanceService(
+    packer: AutoPackService(index: index),
+    dates: CaptureDateRecoveryService(index: index),
+    backfill: BackfillService(index: index),
+    lock: MaintenanceLock.standard(),
+    unmetered: unmeteredNetwork,
+    charging: () async => charging,
+    userBusy: () => registry.queueRecentlyActive || registry.appRecentlyAlive,
+    maxBackfillChunks: charging ? maintenanceBackfillChunks : 0,
+    budget: inlineRunBudget,
+  );
+  _activeMaintenance = service;
+  try {
+    final r = await service.runOnce(queueJustFinished: afterUploads);
+    debugPrint('TVBG: maintenance ${r.skipped ?? 'done'} packs=${r.packs} '
+        'dates=${r.datesProcessed} backfillChunks=${r.backfillChunks} '
+        'produced=${r.backfillProduced}');
+  } finally {
+    if (identical(_activeMaintenance, service)) _activeMaintenance = null;
+  }
 }
 
 /// The pending assets of the backup-enabled albums (minus those uploaded and
@@ -579,6 +685,8 @@ void callbackDispatcher() {
       try {
         if (job == HeadlessJob.check) {
           await runHeadlessCheck();
+        } else if (job == HeadlessJob.maintenance) {
+          await runHeadlessMaintenance(charging: true);
         } else {
           await runHeadlessSync();
         }

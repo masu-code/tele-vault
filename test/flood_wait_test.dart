@@ -14,6 +14,8 @@ import 'package:tele_vault/core/telegram/client.dart';
 import 'package:tele_vault/core/telegram/io_socket.dart';
 import 'package:tg/tg.dart' as tg;
 
+import 'support/fake_flood_time.dart';
+
 /// FLOOD_WAIT is handled once, in [TelegramService.call]: a wait of up to
 /// [TelegramService.maxFloodWaitSeconds] is waited out (N+1 s) and the same
 /// action retried, at most [TelegramService.maxFloodWaitRetries] times; a
@@ -87,12 +89,12 @@ void main() {
     svc.debugAttach(client, await socket());
     svc.idleProbeAfter = const Duration(hours: 1);
     waits.clear();
-    svc.debugFloodWaitDelay = (d) async => waits.add(d);
+    FakeFloodTime(waits).install(svc);
   });
 
   tearDown(() async {
     final svc = TelegramService.instance;
-    svc.debugFloodWaitDelay = null;
+    FakeFloodTime.uninstall(svc);
     svc.idleProbeAfter = const Duration(seconds: 20);
     for (final s in sockets) {
       try {
@@ -160,7 +162,7 @@ void main() {
 
   test('on the worker, the wait reports progress and the retry succeeds', () async {
     // The real wait (1 + 1 s), so the worker-side progress touch is exercised.
-    TelegramService.instance.debugFloodWaitDelay = null;
+    FakeFloodTime.uninstall(TelegramService.instance);
     final port = ReceivePort();
     final messages = <Map>[];
     final done = Completer<void>();

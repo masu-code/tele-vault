@@ -8,6 +8,7 @@ import 'package:workmanager/workmanager.dart';
 import 'app/app.dart';
 import 'core/backup/headless_sync.dart';
 import 'core/download/download_worker.dart';
+import 'core/telegram/client.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -41,16 +42,16 @@ void main() async {
   // are pending it schedules a one-off foreground run (headless_sync.dart).
   // `update` (not `keep`) so the registered spec always matches this code;
   // it keeps the existing schedule and never cancels a running run.
+  // Only with a saved session: after "Log out" the tasks stay cancelled
+  // across restarts, and a login schedules them again (see AuthNotifier).
   if (Platform.isAndroid) {
     unawaited(() async {
       await Workmanager().initialize(callbackDispatcher);
-      await Workmanager().registerPeriodicTask(
-        uploadSyncTaskName,
-        uploadSyncTaskName,
-        frequency: const Duration(minutes: 15),
-        constraints: Constraints(networkType: NetworkType.connected),
-        existingWorkPolicy: ExistingPeriodicWorkPolicy.update,
-      );
+      if (await TelegramService.instance.hasSession()) {
+        await scheduleHeadlessSync();
+      } else {
+        await cancelHeadlessSync();
+      }
     }());
   }
 

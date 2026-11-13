@@ -203,6 +203,149 @@ Future<Uint8List> _downloadPackBytes(int messageId) async {
   return out;
 }
 
+/// What [readPackToc] found. Plain data, sendable between isolates.
+class PackTocResult {
+  const PackTocResult({
+    required this.messageId,
+    this.packId = '',
+    this.ids = const [],
+    this.error,
+    this.permanent = false,
+  });
+
+  final int messageId;
+  final String packId;
+
+  /// Entry ids the pack holds (the ones an install would write).
+  final List<String> ids;
+
+  /// Null on success.
+  final String? error;
+
+  /// True when retrying cannot help (not a TVTP document, message gone, ...).
+  final bool permanent;
+
+  bool get ok => error == null;
+}
+
+/// Window of a TOC read: offsets are multiples of it (so 4 KB aligned) and it
+/// divides 1 MB, as `upload.getFile` requires.
+const int kPackTocWindow = 64 * 1024;
+
+/// Ranged access to one pack document: its size and a reader of one window.
+typedef PackRangeReader = ({int size, Future<Uint8List> Function(int offset, int limit) read});
+
+/// Reads only the header and TOC of pack message [messageId] (ranged reads of
+/// [kPackTocWindow], never the whole pack) and returns the ids it holds. A
+/// network or FLOOD_WAIT failure is retryable (`permanent == false`); a
+/// message that is gone or not a TVTP v1 pack is permanent. Top-level so it
+/// runs through `DownloadWorker.run`.
+Future<PackTocResult> readPackToc(int messageId) =>
+    readPackTocWith(messageId, open: _openPackDocument);
+
+/// [readPackToc] with the document access injected (tests).
+Future<PackTocResult> readPackTocWith(
+  int messageId, {
+  required Future<PackRangeReader> Function(int messageId) open,
+}) async {
+  PackTocResult failure(String message, {bool permanent = false}) =>
+      PackTocResult(messageId: messageId, error: message, permanent: permanent);
+
+  final PackRangeReader doc;
+  try {
+    doc = await open(messageId);
+  } on _PackGone {
+    return failure('no pack document', permanent: true);
+  } catch (e) {
+    return failure('lookup failed: ${e.runtimeType}');
+  }
+  if (doc.size < ThumbPackCodec.headerLength || doc.size > kMaxPackDocumentBytes) {
+    return failure('bad pack size', permanent: true);
+  }
+
+  final head = BytesBuilder(copy: false);
+  var need = ThumbPackCodec.headerLength;
+  var headerParsed = false;
+  var offset = 0;
+  while (head.length < need) {
+    if (offset >= doc.size) return failure('truncated pack', permanent: true);
+    final Uint8List chunk;
+    try {
+      chunk = await doc.read(offset, kPackTocWindow);
+    } catch (e) {
+      return failure('read failed: ${e.runtimeType}');
+    }
+    final expected = doc.size - offset < kPackTocWindow ? doc.size - offset : kPackTocWindow;
+    if (chunk.length < expected) return failure('short read');
+    head.add(chunk.length > expected ? Uint8List.sublistView(chunk, 0, expected) : chunk);
+    offset += kPackTocWindow;
+    if (!headerParsed && head.length >= ThumbPackCodec.headerLength) {
+      headerParsed = true;
+      final b = head.toBytes();
+      if (b[0] != 0x54 || b[1] != 0x56 || b[2] != 0x54 || b[3] != 0x50) {
+        return failure('bad magic', permanent: true);
+      }
+      final tocLen = ByteData.sublistView(b).getUint32(8, Endian.little);
+      if (tocLen > ThumbPackCodec.maxTocBytes) return failure('TOC too large', permanent: true);
+      need = ThumbPackCodec.headerLength + tocLen;
+    }
+  }
+
+  final ThumbPackToc toc;
+  try {
+    toc = ThumbPackCodec.readToc(head.toBytes());
+  } on ThumbPackFormatException catch (e) {
+    return failure('bad pack: ${e.message}', permanent: true);
+  } catch (_) {
+    return failure('bad pack', permanent: true);
+  }
+  return PackTocResult(
+    messageId: messageId,
+    packId: toc.packId,
+    ids: [for (final e in toc.entries) if (ThumbKey.isSafe(e.id)) e.id],
+  );
+}
+
+class _PackGone implements Exception {
+  const _PackGone();
+}
+
+/// The pack document of [messageId] with a fresh file reference, read one
+/// window per `upload.getFile`. No retry here: a failure (FLOOD_WAIT
+/// included) makes the TOC read fail and the caller tries again later.
+Future<PackRangeReader> _openPackDocument(int messageId) async {
+  final t.Document doc;
+  try {
+    doc = await DownloadService.instance.fetchDocument(messageId);
+  } on DownloadException catch (e) {
+    if (e.message.startsWith('No document found')) throw const _PackGone();
+    rethrow;
+  }
+  Future<Uint8List> read(int offset, int limit) async {
+    final result = await TelegramService.instance.call(
+      (c) => c.upload.getFile(
+        precise: false,
+        cdnSupported: false,
+        location: t.InputDocumentFileLocation(
+          id: doc.id,
+          accessHash: doc.accessHash,
+          fileReference: doc.fileReference,
+          thumbSize: '',
+        ),
+        offset: offset,
+        limit: limit,
+      ),
+    );
+    final file = result.result;
+    if (result.error != null || file is! t.UploadFile) {
+      throw DownloadException('getFile failed');
+    }
+    return file.bytes;
+  }
+
+  return (size: doc.size, read: read);
+}
+
 /// Pack messages in Saved Messages, found by their caption marker. Empty
 /// (never throws) when the search fails. Returned refs have `count == 0`
 /// (unknown until the pack is read). Top-level so it runs through

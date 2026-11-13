@@ -302,9 +302,8 @@ class _ViewerChromeHostState extends State<ViewerChromeHost>
   /// touching down means this is a pinch, not a tap/vertical-drag — bailing
   /// out of whatever pan we were tracking the instant that happens (rather
   /// than waiting for the current page to report itself zoomed, which only
-  /// flips once its InteractiveViewer has *already* registered a scale)
-  /// stops it from fighting InteractiveViewer's scale gesture for the same
-  /// pointers.
+  /// flips once its PhotoView has *already* applied a scale) stops it from
+  /// fighting the photo page's pinch for the same pointers.
   int _activePointers = 0;
 
   // --- Raw pointer-driven pan/tap tracking ---------------------------------
@@ -453,8 +452,17 @@ class _ViewerChromeHostState extends State<ViewerChromeHost>
     if (_activePointers > 1) {
       // A second finger mid-pan means this just became a pinch — release
       // whatever we were tracking (and un-freeze paging if we'd frozen it)
-      // so InteractiveViewer's scale gesture starts from a clean slate.
-      if (_panIsVertical == true) widget.onDismissDragChanged?.call(false);
+      // so the photo's pinch starts from a clean slate, and put a
+      // half-dragged viewer or info panel back instead of leaving it
+      // stranded where the first finger had pulled it.
+      if (_panIsVertical == true) {
+        widget.onDismissDragChanged?.call(false);
+        if (_dismissOffset > 0) {
+          _snapDismissTo(0);
+        } else {
+          _snapPanelTo(_panelExtent > _maxPanelExtent / 2 ? _maxPanelExtent : 0);
+        }
+      }
       _panPointer = null;
       _panIsVertical = null;
       return;
@@ -474,7 +482,7 @@ class _ViewerChromeHostState extends State<ViewerChromeHost>
     _velocityTracker?.addPosition(event.timeStamp, event.localPosition);
 
     // While the current page is zoomed, a one-finger move is
-    // InteractiveViewer's to pan the photo with — we still track it (so a
+    // PhotoView's to pan the photo with — we still track it (so a
     // real pan doesn't misfire as a tap on release below) but don't act on
     // the axis or drive dismiss/panel.
     if (_zoomedIn) return;

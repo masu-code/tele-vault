@@ -458,7 +458,7 @@ void main() {
     const files = [
       'lib/core/thumbnail/backfill_service.dart',
       'lib/core/thumbnail/backfill_state.dart',
-      'lib/features/profile/screens/backfill_screen.dart',
+      'lib/features/profile/providers/maintenance_provider.dart',
     ];
     final forbidden = 'delete' 'Messages';
     for (final path in files) {

@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'dart:math' as math;
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:path_provider/path_provider.dart';
 import 'package:t/t.dart' as t;
 import 'package:tg/tg.dart' as tg;
@@ -40,6 +41,21 @@ class FloodWaitException implements Exception {
   String toString() => '${_prefix}FLOOD_WAIT_$seconds';
 }
 
+/// Server errors that mean this session's authorization key was killed
+/// (logged out from another device, terminated in Telegram's settings).
+/// Only a hint: see [TelegramService.confirmRevocation], which probes before
+/// anything is treated as a revocation, because AUTH_KEY_UNREGISTERED also
+/// shows up as a sporadic one-off that a reconnect cures.
+const _revocationErrors = {'AUTH_KEY_UNREGISTERED', 'SESSION_REVOKED'};
+
+/// Whether [errorMessage] is one of [_revocationErrors].
+bool isRevocationError(String errorMessage) =>
+    _revocationErrors.any(errorMessage.startsWith);
+
+/// Whether [text] (an error that crossed an isolate boundary as text, possibly
+/// wrapped in an exception name) carries one of [_revocationErrors].
+bool mentionsRevocation(String text) => _revocationErrors.any(text.contains);
+
 /// Seed IPs used only to bootstrap the very first connection, before the
 /// server's own data-center list is known. Production Telegram addresses; the
 /// authoritative list arrives in the Config from initConnection and takes over
@@ -76,6 +92,15 @@ class TelegramService {
   /// Cleared only by [clearSession] (logout / dead session).
   tg.AuthorizationKey? _lastKey;
 
+  /// DC of the authenticated session (the one [saveSession] wrote or
+  /// [restoreSession] read); null while there is no such session, e.g. during
+  /// login, when the connection holds a key nothing authorized yet. Only an
+  /// auth error on this DC can mean the session was revoked: this client has
+  /// no file-DC / exported-authorization connections today, but a connection
+  /// on any other DC (a login migration, or one added later) is expected to
+  /// answer AUTH_KEY_UNREGISTERED until it is authorized there.
+  int? _homeDcId;
+
   /// DC list reported by the server. Preferred over [_seedDcs] when present,
   /// since seed IPs can drift and only cover the common datacenters.
   List<t.DcOption> _dcOptions = [];
@@ -110,6 +135,7 @@ class TelegramService {
   /// Connects to [dcId] (or the current DC). When [authKey] is supplied the
   /// handshake is skipped and that key is reused (restored session).
   Future<tg.Client> connect({int? dcId, tg.AuthorizationKey? authKey}) async {
+    final epoch = _sessionEpoch;
     // Drop whatever is currently open first. This used to just overwrite
     // _client/_socket at the end, which left the previous socket live and
     // unreferenced — still connected to the same DC, still being fed by the
@@ -125,6 +151,13 @@ class TelegramService {
     final fake = debugConnectOverride;
     if (fake != null) {
       await fake(_dcId, authKey);
+      if (epoch != _sessionEpoch) {
+        await _socket?.close();
+        _client = null;
+        _socket = null;
+        _lastKey = null;
+        throw StateError(_clearedWhileConnecting);
+      }
       final attached = this.client;
       _lastKey = attached.authorizationKey;
       return attached;
@@ -183,11 +216,25 @@ class TelegramService {
       _dcOptions = config.dcOptions.whereType<t.DcOption>().toList();
     }
 
+    // clearSession ran while this connection was being made (a reconnect
+    // started by a revocation probe, for one): installing it would put the
+    // forgotten key back in memory.
+    if (epoch != _sessionEpoch) {
+      await ioSocket.close();
+      throw StateError(_clearedWhileConnecting);
+    }
+
     _socket = ioSocket;
     _client = client;
     _lastKey = key;
     return client;
   }
+
+  static const _clearedWhileConnecting = 'Session was cleared while connecting';
+
+  /// Bumped by [clearSession]. [connect] captures it at the start and drops
+  /// its new connection if it changed before the connection was installed.
+  int _sessionEpoch = 0;
 
   /// Closes the current connection without touching the saved session, so the
   /// next [connect] starts clean. Used after a transport failure during login,
@@ -244,21 +291,201 @@ class TelegramService {
   /// N <= [maxFloodWaitSeconds] the same [action] is retried after N+1 s, at
   /// most [maxFloodWaitRetries] times; a longer wait (or one still there after
   /// the retries) throws [FloodWaitException] instead of returning the error.
+  ///
+  /// The wait is shared: a FLOOD_WAIT closes a per-isolate gate
+  /// ([_noteFloodWait]) and every call, a new one or a retry, first waits for
+  /// it ([_awaitFloodGate]). One flood pauses all the callers once, instead of
+  /// each of them running into its own flood while the others keep asking.
   Future<T> call<T>(Future<T> Function(tg.Client) action) async {
     for (var retry = 0;; retry++) {
+      await _awaitFloodGate();
       final value = await _callOnce(action);
+      _noteAuthError(value);
       final seconds = _floodWaitOf(value);
       if (seconds == null) return value;
-      if (seconds > maxFloodWaitSeconds || retry >= maxFloodWaitRetries) {
+      if (seconds > maxFloodWaitSeconds) {
         // ignore: avoid_print
         print('TVDIAG: FLOOD_WAIT ${seconds}s, giving up (retries $retry)');
         throw FloodWaitException(seconds);
       }
-      // ignore: avoid_print
-      print('TVDIAG: FLOOD_WAIT ${seconds}s, retry ${retry + 1}/$maxFloodWaitRetries');
-      await (debugFloodWaitDelay ?? _floodWaitDelay)(Duration(seconds: seconds + 1));
+      _noteFloodWait(seconds);
+      if (retry >= maxFloodWaitRetries) {
+        // ignore: avoid_print
+        print('TVDIAG: FLOOD_WAIT ${seconds}s, giving up (retries $retry)');
+        throw FloodWaitException(seconds);
+      }
     }
   }
+
+  /// When the shared flood gate opens again (null: never closed). Only a
+  /// FLOOD_WAIT up to [maxFloodWaitSeconds] closes it: a longer one fails its
+  /// caller fast and must not freeze every other request for minutes.
+  DateTime? _floodGateUntil;
+
+  /// Called once each time the gate closes (not when an open gate is only
+  /// extended), with the wait Telegram asked for. Returns the concurrency of
+  /// the bulk thumbnail fetch after it reacted (for the log line), or null.
+  /// Set by the thumbnail fetch (`server_thumb_batch.dart`) in its isolate.
+  int? Function(int seconds)? onFloodGate;
+
+  static final math.Random _jitterRandom = math.Random();
+
+  /// Test-only: replaces the clock the gate reads.
+  @visibleForTesting
+  DateTime Function()? debugClock;
+
+  /// Test-only: replaces the random jitter added to a gate.
+  @visibleForTesting
+  Duration Function()? debugFloodJitter;
+
+  /// Test-only: opens the gate and drops the flood hook.
+  @visibleForTesting
+  void debugResetFloodGate() {
+    _floodGateUntil = null;
+    onFloodGate = null;
+  }
+
+  /// The gate's closing time (tests).
+  @visibleForTesting
+  DateTime? get floodGateUntil => _floodGateUntil;
+
+  DateTime _now() => (debugClock ?? DateTime.now)();
+
+  /// Closes the gate for N+1 s (plus up to half a second of jitter, so callers
+  /// released together do not hit Telegram in the same instant). Overlapping
+  /// waits keep the later opening time. The first flood of an episode, the one
+  /// that finds the gate open, logs one line and tells [onFloodGate]; floods of
+  /// calls that were already in flight when it closed only extend it.
+  void _noteFloodWait(int seconds) {
+    final now = _now();
+    final jitter = debugFloodJitter?.call() ??
+        Duration(milliseconds: _jitterRandom.nextInt(500));
+    final until = now.add(Duration(seconds: seconds + 1)).add(jitter);
+    final current = _floodGateUntil;
+    final wasClosed = current != null && now.isBefore(current);
+    if (!wasClosed || until.isAfter(current)) _floodGateUntil = until;
+    if (wasClosed) return;
+    final concurrency = onFloodGate?.call(seconds);
+    // ignore: avoid_print
+    print('TVDIAG: flood gate ${seconds}s (concurrency=${concurrency ?? '-'})');
+  }
+
+  /// Waits until the gate is open. A gate extended while waiting is waited
+  /// out again; otherwise the one wait is enough.
+  Future<void> _awaitFloodGate() async {
+    while (true) {
+      final until = _floodGateUntil;
+      if (until == null) return;
+      final wait = until.difference(_now());
+      if (wait <= Duration.zero) return;
+      await (debugFloodWaitDelay ?? _floodWaitDelay)(wait);
+      if (_floodGateUntil == until) return;
+    }
+  }
+
+  /// Set by the app: runs the local cleanup + login routing once a revocation
+  /// is confirmed (see [confirmRevocation]). Null in the worker isolates and
+  /// the headless engine, which have no UI to route: there an auth error just
+  /// fails the request (the UI isolate learns of it through its own calls and
+  /// the transfer queue's failures).
+  Future<void> Function()? onSessionRevoked;
+
+  /// After an inconclusive or transient probe, further auth errors do not
+  /// probe again for this long (a mass upload failing 100 times must not
+  /// cost 100 probes and reconnects).
+  @visibleForTesting
+  Duration revocationCooldown = const Duration(seconds: 15);
+
+  Future<bool>? _revocationCheck;
+  DateTime? _revocationCheckedAt;
+
+  /// Test-only: replaces the probe RPC. Returns the error message the
+  /// request came back with, or null when it succeeded.
+  @visibleForTesting
+  Future<String?> Function(tg.Client client)? debugRevocationProbe;
+
+  /// A revocation hint seen in an RPC result: starts [confirmRevocation].
+  void _noteAuthError(Object? value) {
+    if (onSessionRevoked == null) return;
+    if (value is! t.Result) return;
+    final message = value.error?.errorMessage;
+    if (message == null || !isRevocationError(message)) return;
+    unawaited(confirmRevocation().catchError((Object _) => false));
+  }
+
+  /// Confirms with one probe (`users.getUsers` for self, on a fresh
+  /// connection that reuses the session key) that the server really dropped
+  /// this session, and then runs [onSessionRevoked]. Returns true only for a
+  /// confirmed revocation.
+  ///
+  /// Anything short of that — the probe succeeding (a transient error), failing
+  /// for another reason (offline, timeout, flood), the connection not being
+  /// the home DC's, or the session having changed meanwhile — returns false and
+  /// leaves the session alone: wiping a good session forces a full re-login
+  /// (phone + code + 2FA). Concurrent callers share one check.
+  Future<bool> confirmRevocation() {
+    final inFlight = _revocationCheck;
+    if (inFlight != null) return inFlight;
+    final last = _revocationCheckedAt;
+    if (last != null && DateTime.now().difference(last) < revocationCooldown) {
+      return Future.value(false);
+    }
+    final check = _confirmRevocation();
+    _revocationCheck = check;
+    check.whenComplete(() {
+      if (identical(_revocationCheck, check)) _revocationCheck = null;
+    }).ignore();
+    return check;
+  }
+
+  Future<bool> _confirmRevocation() async {
+    final home = _homeDcId;
+    final key = _lastKey;
+    if (home == null || key == null || _dcId != home) {
+      debugPrint('TVAUTH: auth error outside the home session, not a revocation');
+      return false;
+    }
+    var confirmed = false;
+    try {
+      // A fresh socket on the same key (I1: never a new handshake): rules
+      // out a connection that merely went bad.
+      await reconnect().timeout(_reconnectTimeout);
+      final message = await _probeSelf(client);
+      confirmed = message != null && isRevocationError(message);
+      debugPrint('TVAUTH: revocation probe '
+          '${confirmed ? 'confirmed' : message == null ? 'ok (transient)' : 'inconclusive'}');
+    } catch (e) {
+      debugPrint('TVAUTH: revocation probe failed (${e.runtimeType}), keeping session');
+    }
+    _revocationCheckedAt = DateTime.now();
+    if (!confirmed) return false;
+    // The user may have logged out (or in as someone else) while probing.
+    if (_homeDcId != home || _lastKey?.id != key.id) return false;
+    final handler = onSessionRevoked;
+    if (handler == null) return false;
+    try {
+      await handler();
+    } catch (e) {
+      debugPrint('TVAUTH: revocation handler failed (${e.runtimeType})');
+    }
+    return true;
+  }
+
+  /// The probe RPC: the error message it came back with, null on success.
+  Future<String?> _probeSelf(tg.Client c) async {
+    final fake = debugRevocationProbe;
+    if (fake != null) return fake(c);
+    final result = await _attempt(
+      c,
+      _socket,
+      (c) => c.users.getUsers(id: const [t.InputUserSelf()]),
+    );
+    return result.error?.errorMessage;
+  }
+
+  /// Test-only: marks the authenticated session's home DC.
+  @visibleForTesting
+  void debugSetHomeDc(int? dcId) => _homeDcId = dcId;
 
   /// Longest FLOOD_WAIT that [call] waits out instead of failing fast.
   static const int maxFloodWaitSeconds = 120;
@@ -565,10 +792,13 @@ class TelegramService {
     // _client is null after a failed reconnect or a dropConnection(); the key
     // must survive that, or the connect below would negotiate a brand-new,
     // unregistered key (see [_lastKey]).
+    final epoch = _sessionEpoch;
     final key = _client?.authorizationKey ?? _lastKey;
     await _socket?.close();
     _client = null;
     _socket = null;
+    // clearSession may have run during the close above; do not put its key back.
+    if (epoch != _sessionEpoch) throw StateError(_clearedWhileConnecting);
     if (key == null) {
       // A handshake only ever happens through an explicit connect() (login).
       throw StateError(
@@ -589,6 +819,7 @@ class TelegramService {
     print('TVDIAG: restoreSession() session loaded: ${saved != null}');
     if (saved == null) return false;
     await connect(dcId: saved.dcId, authKey: saved.key);
+    _homeDcId = saved.dcId;
     return true;
   }
 
@@ -601,10 +832,17 @@ class TelegramService {
       'key': c.authorizationKey.toJson(),
     });
     await File('${dir.path}/tele_vault_session.json').writeAsString(data);
+    _homeDcId = _dcId;
   }
 
+  /// Forgets the session: the in-memory key, the home DC, the connection and
+  /// the session file. After this no [call] can reach Telegram (reconnecting
+  /// needs a key, and a handshake only ever happens through [connect]).
   Future<void> clearSession() async {
+    _sessionEpoch++;
     _lastKey = null;
+    _homeDcId = null;
+    _revocationCheckedAt = null;
     final dir = await getApplicationDocumentsDirectory();
     final file = File('${dir.path}/tele_vault_session.json');
     if (await file.exists()) await file.delete();

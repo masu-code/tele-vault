@@ -26,6 +26,10 @@ abstract final class TvStats {
   /// A gallery tile `build` ran.
   static int tileBuilds = 0;
 
+  /// A gallery tile `initState` ran: a tile element was created rather than
+  /// reused (scrolling a new one into the cache extent, or a lost element).
+  static int tileInits = 0;
+
   /// Builds per screen/widget name (see class doc for allowed names).
   static final Map<String, int> screenBuilds = <String, int>{};
 
@@ -45,6 +49,10 @@ abstract final class TvStats {
 
   static void tileBuild() {
     if (!kReleaseMode) tileBuilds++;
+  }
+
+  static void tileInit() {
+    if (!kReleaseMode) tileInits++;
   }
 
   static void tileBlank() {
@@ -75,6 +83,7 @@ abstract final class TvStats {
   static void reset() {
     tileBlankFrames = 0;
     tileBuilds = 0;
+    tileInits = 0;
     screenBuilds.clear();
     rpcProbeReconnects = 0;
     longTasksOver32ms = 0;
@@ -160,6 +169,7 @@ abstract final class TvStats {
     return <String, dynamic>{
       'tileBlankFrames': tileBlankFrames,
       'tileBuilds': tileBuilds,
+      'tileInits': tileInits,
       // tileBuilds == 0 means no tile hook is installed: tileBlankFrames is
       // then NOT a measurement.
       'tileHooksActive': tileBuilds > 0,

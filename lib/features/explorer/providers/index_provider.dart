@@ -136,6 +136,28 @@ class IndexNotifier extends StateNotifier<IndexState> {
     return result;
   }
 
+  /// Log out: back to the state of a fresh install. Waits (bounded) for the
+  /// queued writes to settle first, so a save finishing late cannot put the
+  /// old account's index back in state, then forgets the loaded index, the
+  /// published-cache flag and the in-flight load. The device cache is
+  /// deleted by [IndexService.clearLocal]; a login's [load] starts clean.
+  Future<void> resetForLogout() async {
+    try {
+      await _writeChain.timeout(const Duration(seconds: 5));
+    } catch (_) {}
+    _cachePublished = false;
+    _hasUsableIndex = false;
+    _lastDroppedDuplicates = const [];
+    _loading = null;
+    if (mounted) state = const IndexState();
+  }
+
+  /// Log out, local half: [resetForLogout] plus [IndexService.clearLocal].
+  Future<void> clearForLogout() async {
+    await resetForLogout();
+    await _service.clearLocal();
+  }
+
   /// Loads the index from Telegram. Call once the user is authenticated.
   ///
   /// The first call publishes the on-device cache right away (decoded off

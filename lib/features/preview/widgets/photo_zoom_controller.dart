@@ -1,8 +1,21 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:photo_view/photo_view.dart';
 
-/// Owns a photo page's pan/zoom transform: the [InteractiveViewer]'s
-/// controller, the "is zoomed in" flag the surrounding gestures key off, and
-/// the animated double-tap zoom.
+/// Owns a photo page's pan/zoom state: the `photo_view` [PhotoViewController]
+/// (scale + position), the "is zoomed in" flag the surrounding gestures key
+/// off, and the animated double-tap zoom.
+///
+/// Pinch and pan are `photo_view`'s own gesture recognizer; this class only
+/// reads its result and drives the double-tap, which [ViewerChromeHost]
+/// detects (it owns every tap on the viewer) and `photo_view` cannot anchor on
+/// the tapped point.
+///
+/// The page builds its [PhotoView] with a fixed child size (the viewport), so
+/// [scale] is relative to the fitted photo, 1.0 = fitted, regardless of which
+/// decode (thumbnail, 1x, 2x) is on screen. That is what lets the thumbnail be
+/// zoomed before the full-resolution file arrives and keeps the zoom and pan
+/// untouched when it does.
 ///
 /// The flag matters more than it looks: a zoomed photo has to keep one-finger
 /// drags for panning, so BOTH [ViewerChromeHost]'s swipe gestures and the
@@ -15,20 +28,44 @@ class PhotoZoomController {
         vsync: vsync,
         duration: const Duration(milliseconds: 200),
       ) {
-    transform.addListener(_syncZoomed);
-    _animation.addListener(() {
-      final matrix = _tween?.value;
-      if (matrix != null) transform.value = matrix;
-    });
+    // The stream, not addIgnorableListener: photo_view's own snap-back
+    // animations (pinched below 1x or past [maxScale]) update the scale
+    // "invisibly", which only the stream reports.
+    _subscription = view.outputStateStream.listen((_) => _syncZoomed());
+    _animation.addListener(_onAnimationTick);
   }
+
+  /// Fitted size. Pinching below it springs back.
+  static const double minScale = 1.0;
+
+  /// Deepest zoom, relative to the fitted size.
+  static const double maxScale = 5.0;
 
   /// What a double-tap zooms to. Roughly matches Google Photos — enough to
   /// read detail in one tap, not so far that you lose your place.
   static const double _doubleTapScale = 2.5;
 
-  final TransformationController transform = TransformationController();
+  /// Scale and position (offset of the photo's centre from the viewport's
+  /// centre) of the page's [PhotoView].
+  final PhotoViewController view = PhotoViewController();
+
+  /// Passed to the page's [PhotoView] together with [noDoubleTapCycle], so
+  /// photo_view's built-in double-tap never fights [toggleZoom].
+  final PhotoViewScaleStateController scaleState =
+      PhotoViewScaleStateController();
+
+  /// The page's viewport, set by the page on layout. [toggleZoom] needs its
+  /// centre to keep the tapped point under the finger.
+  Size viewportSize = Size.zero;
+
   final AnimationController _animation;
-  Animation<Matrix4>? _tween;
+  late final StreamSubscription<PhotoViewControllerValue> _subscription;
+  Tween<double>? _scaleTween;
+  Tween<Offset>? _positionTween;
+
+  /// Current scale relative to the fitted photo (null before photo_view's
+  /// first layout, which means fitted).
+  double get scale => view.scale ?? minScale;
 
   /// True once the photo is scaled past its fitted size.
   final ValueNotifier<bool> zoomed = ValueNotifier(false);
@@ -44,7 +81,8 @@ class PhotoZoomController {
   static const double _highResOffScale = 1.05;
 
   void _syncZoomed() {
-    final scale = transform.value.getMaxScaleOnAxis();
+    if (_disposed) return;
+    final scale = this.scale;
     final isZoomed = scale > 1.01;
     if (isZoomed != zoomed.value) zoomed.value = isZoomed;
     if (!highRes.value && scale > _highResOnScale) {
@@ -54,34 +92,54 @@ class PhotoZoomController {
     }
   }
 
+  bool _disposed = false;
+
+  /// For [PhotoView.scaleStateCycle]: never moves to another scale state, so
+  /// photo_view's own double-tap recognizer is a no-op and [toggleZoom]
+  /// (driven by [ViewerChromeHost]) is the only double-tap zoom.
+  static PhotoViewScaleState noDoubleTapCycle(PhotoViewScaleState actual) =>
+      actual;
+
   /// Toggles between fitted and [_doubleTapScale], keeping whatever is under
-  /// [localPosition] roughly under the finger instead of always zooming into
-  /// the middle of the photo.
+  /// [localPosition] (viewport coordinates) under the finger instead of
+  /// always zooming into the middle of the photo.
   void toggleZoom(Offset localPosition) {
-    final target = zoomed.value
-        ? Matrix4.identity()
-        : (Matrix4.identity()
-            ..translateByDouble(
-              -localPosition.dx * (_doubleTapScale - 1),
-              -localPosition.dy * (_doubleTapScale - 1),
-              0,
-              1,
-            )
-            ..scaleByDouble(
-              _doubleTapScale,
-              _doubleTapScale,
-              _doubleTapScale,
-              1,
-            ));
-    _tween = Matrix4Tween(begin: transform.value, end: target).animate(
-      CurvedAnimation(parent: _animation, curve: Curves.easeOutCubic),
-    );
+    final double targetScale;
+    final Offset targetPosition;
+    if (zoomed.value) {
+      targetScale = minScale;
+      targetPosition = Offset.zero;
+    } else {
+      // photo_view scales about the viewport centre and then translates by
+      // `position`; a point `d` from the centre lands at `position + s*d`,
+      // so `position = -d * (s - 1)` keeps it where it was. Always inside
+      // photo_view's pan bounds for a point inside the viewport.
+      final fromCentre = localPosition - viewportSize.center(Offset.zero);
+      targetScale = _doubleTapScale;
+      targetPosition = -fromCentre * (_doubleTapScale - 1);
+    }
+    _scaleTween = Tween(begin: scale, end: targetScale);
+    _positionTween = Tween(begin: view.position, end: targetPosition);
     _animation.forward(from: 0);
   }
 
+  void _onAnimationTick() {
+    final scaleTween = _scaleTween;
+    final positionTween = _positionTween;
+    if (scaleTween == null || positionTween == null) return;
+    final t = Curves.easeOutCubic.transform(_animation.value);
+    view.updateMultiple(
+      scale: scaleTween.transform(t),
+      position: positionTween.transform(t),
+    );
+  }
+
   void dispose() {
+    _disposed = true;
+    _subscription.cancel();
     _animation.dispose();
-    transform.dispose();
+    view.dispose();
+    scaleState.dispose();
     zoomed.dispose();
     highRes.dispose();
   }

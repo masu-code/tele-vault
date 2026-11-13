@@ -33,13 +33,17 @@ It is built for Android (a Windows build also compiles). It works like a photo b
 
 ## Screenshots
 
-<!-- TODO: take these from a synthetic gallery (never from a real library) and save them under docs/screenshots/. -->
+Taken from a demo library of free sample photos (see [`tool/demo/photos/CREDITS.md`](tool/demo/photos/CREDITS.md)), never from a real library.
 
-| Gallery | Viewer | Backup |
+| Gallery | Viewer | Albums |
 |---|---|---|
-| <!-- TODO: docs/screenshots/gallery.png --> | <!-- TODO: docs/screenshots/viewer.png --> | <!-- TODO: docs/screenshots/backup.png --> |
+| <img src="docs/screenshots/gallery.png" width="240" alt="Gallery: one timeline of phone and cloud photos grouped by month, with a cloud badge on backed-up items and play icons on videos"> | <img src="docs/screenshots/viewer.png" width="240" alt="Full-screen photo viewer with share, uploaded, download, add to album, archive and delete actions"> | <img src="docs/screenshots/albums.png" width="240" alt="Albums: a grid of albums with cover photos and item counts"> |
 
-<!-- TODO: add albums.png, files.png and account.png (docs/screenshots/*.png) and reference them here and in docs/index.html. -->
+| Backup | Files | Account |
+|---|---|---|
+| <img src="docs/screenshots/backup.png" width="240" alt="Account sheet with a backup upload in progress, device storage use and background backup status"> | <img src="docs/screenshots/files.png" width="240" alt="Files: folders and files stored in Telegram, with thumbnails for images"> | <img src="docs/screenshots/account.png" width="240" alt="Account sheet with the Telegram account, device storage, archive, thumbnail backfill and mobile data options"> |
+
+To regenerate them (Android emulator only, never a real phone): `tool/demo/screenshots.ps1`, then `python tool/demo/optimize_screenshots.py`.
 
 ## Install
 
@@ -115,6 +119,8 @@ Third-party code keeps its own licenses:
 ## Credits
 
 Built on the work of: [`tg`](https://github.com/telegramflutter/tg) and [`t`](https://pub.dev/packages/t) (MTProto client and TL types), [media_kit](https://github.com/media-kit/media-kit) (video), [photo_manager](https://pub.dev/packages/photo_manager) (device gallery), [Riverpod](https://riverpod.dev/) (state), [workmanager](https://pub.dev/packages/workmanager) (background work), [sqflite](https://pub.dev/packages/sqflite), [flutter_local_notifications](https://pub.dev/packages/flutter_local_notifications), [image](https://pub.dev/packages/image), [ThumbHash](https://github.com/evanw/thumbhash), and Flutter itself.
+
+Demo photos in the screenshots: free CC0 sample photos from Wikimedia Commons (mostly Unsplash photographers; Lorem Picsum, the intended source, was unreachable), see [`tool/demo/photos/CREDITS.md`](tool/demo/photos/CREDITS.md).
 
 ## Disclaimer
 

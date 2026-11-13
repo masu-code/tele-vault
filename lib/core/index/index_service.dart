@@ -149,6 +149,29 @@ class IndexService {
     return c.index;
   }
 
+  /// Log out: forgets everything this isolate and this device know about the
+  /// account's index — the in-memory sync state, the remembered message id,
+  /// and the cached copy (`index_cache.json` + meta). The local backups
+  /// (`index_backups/`) are kept. The next [load] starts from scratch.
+  Future<void> clearLocal() async {
+    _messageId = null;
+    _legacy = false;
+    _documentId = null;
+    _base = null;
+    _baseBytes = null;
+    _synced = false;
+    _syncedAccount = null;
+    _cached = null;
+    await _cache.clear();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_persistedMsgIdKey);
+      await prefs.remove(_persistedLegacyKey);
+    } catch (e) {
+      debugPrint('TVDIAG: index message id not cleared: ${e.runtimeType}');
+    }
+  }
+
   /// Records what the remote holds now, and that this isolate is in sync.
   void _adopt({
     required int? messageId,

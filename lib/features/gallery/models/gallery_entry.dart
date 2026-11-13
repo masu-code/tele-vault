@@ -74,8 +74,42 @@ final Expando<List<GalleryMonthGroup>> _groupsByList = Expando();
 /// descending) into month sections in a single pass. The result is cached by
 /// list identity, so [sorted] must not be mutated after the call (the feed
 /// builds a new list instead of editing one).
+///
+/// A month whose entries are the very same instances, in the same order, as
+/// in the previous result keeps its previous [GalleryMonthGroup] instance, so
+/// the screen can tell which sections actually changed (an upload batch
+/// touches one or two months, not all of them).
 List<GalleryMonthGroup> groupEntriesByMonth(List<GalleryEntry> sorted) {
-  return _groupsByList[sorted] ??= _groupEntriesByMonth(sorted);
+  return _groupsByList[sorted] ??= _lastGroups = _reuseGroups(
+    _lastGroups,
+    _groupEntriesByMonth(sorted),
+  );
+}
+
+/// The last result computed by [groupEntriesByMonth] (the current feed's).
+List<GalleryMonthGroup>? _lastGroups;
+
+List<GalleryMonthGroup> _reuseGroups(
+  List<GalleryMonthGroup>? previous,
+  List<GalleryMonthGroup> next,
+) {
+  if (previous == null || previous.isEmpty) return next;
+  final byMonth = {for (final g in previous) g.month: g};
+  for (var i = 0; i < next.length; i++) {
+    final old = byMonth[next[i].month];
+    if (old != null && _sameEntries(old.entries, next[i].entries)) {
+      next[i] = old;
+    }
+  }
+  return next;
+}
+
+bool _sameEntries(List<GalleryEntry> a, List<GalleryEntry> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (!identical(a[i], b[i])) return false;
+  }
+  return true;
 }
 
 List<GalleryMonthGroup> _groupEntriesByMonth(List<GalleryEntry> sorted) {

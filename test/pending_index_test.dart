@@ -14,6 +14,7 @@ import 'package:tele_vault/core/backup/asset_upload_service.dart';
 import 'package:tele_vault/core/backup/backup_registry.dart';
 import 'package:tele_vault/core/backup/headless_sync.dart';
 import 'package:tele_vault/core/backup/heartbeat.dart';
+import 'package:tele_vault/core/backup/registry_store.dart';
 import 'package:tele_vault/core/index/index_cache.dart';
 import 'package:tele_vault/core/index/index_remote.dart';
 import 'package:tele_vault/core/index/index_service.dart';
@@ -26,6 +27,8 @@ import 'package:tele_vault/models/file_index.dart';
 import 'package:tele_vault/models/file_item.dart';
 import 'package:tele_vault/models/file_part.dart';
 import 'package:tg/tg.dart' as tg;
+
+import 'support/fake_flood_time.dart';
 
 /// An index write that fails after the uploads (a FLOOD_WAIT on the save)
 /// must never get those uploads uploaded again: each upload is persisted as
@@ -206,12 +209,12 @@ void main() {
     svc.debugAttach(client, await socket());
     svc.idleProbeAfter = const Duration(hours: 1);
     waits.clear();
-    svc.debugFloodWaitDelay = (d) async => waits.add(d);
+    FakeFloodTime(waits).install(svc);
   });
 
   tearDown(() async {
     final svc = TelegramService.instance;
-    svc.debugFloodWaitDelay = null;
+    FakeFloodTime.uninstall(svc);
     svc.idleProbeAfter = const Duration(seconds: 20);
     for (final s in sockets) {
       try {
@@ -523,5 +526,48 @@ void main() {
     expect(await registry.isPendingIndex('x'), isTrue);
     await registry.removePendingIndex(['fx']);
     expect(await registry.pendingIndex(), isEmpty);
+  });
+
+  group('pending_index.account migration', () {
+    Future<List<String>> columns(String path) async {
+      final db = await databaseFactoryFfi.openDatabase(path);
+      try {
+        final cols = await db.rawQuery('PRAGMA table_info(pending_index)');
+        return [for (final c in cols) c['name'] as String];
+      } finally {
+        await db.close();
+      }
+    }
+
+    Future<void> legacy(String path) async {
+      final db = await databaseFactoryFfi.openDatabase(path);
+      await db.execute('CREATE TABLE pending_index(file_id TEXT PRIMARY KEY, '
+          'asset_id TEXT NOT NULL, item_json TEXT NOT NULL, '
+          'local_path TEXT NOT NULL, created_ms INTEGER NOT NULL)');
+      await db.close();
+    }
+
+    test('opening twice at once adds the column without failing', () async {
+      final path = p.join(dir.path, 'mig_race.db');
+      await legacy(path);
+      final stores = await Future.wait([
+        RegistryStore.open(factory: databaseFactoryFfi, path: path),
+        RegistryStore.open(factory: databaseFactoryFfi, path: path),
+      ]);
+      for (final s in stores) {
+        await s.close();
+      }
+      expect(await columns(path), contains('account'));
+    });
+
+    test('opening when the column already exists is a no-op', () async {
+      final path = p.join(dir.path, 'mig_again.db');
+      await legacy(path);
+      for (var i = 0; i < 2; i++) {
+        final s = await RegistryStore.open(factory: databaseFactoryFfi, path: path);
+        await s.close();
+      }
+      expect(await columns(path).then((c) => c.where((n) => n == 'account')), hasLength(1));
+    });
   });
 }

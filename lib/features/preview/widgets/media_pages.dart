@@ -7,12 +7,14 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:photo_manager/photo_manager.dart';
+import 'package:photo_view/photo_view.dart';
 import 'package:share_plus/share_plus.dart';
 import '../../../core/backup/asset_upload_service.dart';
 import '../../../core/backup/backup_registry.dart';
 import '../../../core/backup/device_state_bus.dart';
 import '../../../core/download/download_service.dart';
-import '../../../core/download/download_worker.dart' show withInactivityTimeout;
+import '../../../core/download/download_worker.dart'
+    show DownloadWorker, withInactivityTimeout;
 import '../../../core/format_utils.dart';
 import '../../../core/local_storage/local_file_service.dart';
 import '../../../core/thumbnail/thumbnail_service.dart';
@@ -50,10 +52,17 @@ class DragScrollBehavior extends MaterialScrollBehavior {
 const _seekStep = Duration(seconds: 5);
 
 /// Longest a cloud file may go without a progress tick before the viewer gives
-/// up and offers Retry. [DownloadService.downloadToCache] has its own, shorter
-/// guard; this one also covers the stretch where the call is joined to another
-/// caller's in-flight download (whose progress it never sees).
-const _viewerLoadTimeout = Duration(seconds: 90);
+/// up and offers Retry. Kept above [DownloadWorker.transferInactivityTimeout]
+/// (the worker request's own guard, which the download layer keeps alive
+/// through reconnects, file-reference refreshes and FLOOD_WAIT waits), so a
+/// slow first window fails there with a reason code rather than here; this
+/// one is the last resort for anything that never reports at all.
+const _viewerLoadTimeout = Duration(seconds: 180);
+
+/// The safe part of a viewer load failure for the log: class name plus, for a
+/// [DownloadException], its stage/code/part — never the message (paths).
+String _loadFailure(Object e) =>
+    e is DownloadException ? 'DownloadException ${e.reason}' : '${e.runtimeType}';
 
 /// Longest `Player.open` may take before the video page shows its error state.
 const _videoOpenTimeout = Duration(seconds: 20);
@@ -145,17 +154,29 @@ Player _defaultPlayerFactory() =>
 @visibleForTesting
 ViewerPlayerFactory debugPlayerFactory = _defaultPlayerFactory;
 
-// Android: pin the MediaCodec decoder (media_kit's default is `auto-safe`) and
-// attach the surface once the video size is known. Other platforms keep the
-// defaults. [_VideoSession] falls back to `auto-safe` if no frame arrives.
+/// The decoder pinned on Android. media_kit_video 1.3.1 renders with
+/// `vo=gpu` there; plain `mediacodec` (zero-copy) has no interop with that
+/// output in its libmpv, so mpv silently fell back to software decoding
+/// (`TVDIAG: video hwdec=none`) — and since frames still arrived, the
+/// first-frame fallback never ran. `mediacodec-copy` decodes on the hardware
+/// and copies the frame back, which `vo=gpu` can display.
+@visibleForTesting
+const String androidHwdec = 'mediacodec-copy';
+
+// Android: hardware decoding through MediaCodec with media_kit's own `vo=gpu`,
+// surface attached once the video size is known. Other platforms keep
+// media_kit's defaults (`hwdec=auto`, GPU output). [_VideoSession] falls back
+// to `auto-safe` if no frame arrives.
 VideoController _createVideoController(Player player) => VideoController(
   player,
   configuration: Platform.isAndroid
       ? const VideoControllerConfiguration(
-          hwdec: 'mediacodec',
+          vo: 'gpu',
+          hwdec: androidHwdec,
+          enableHardwareAcceleration: true,
           androidAttachSurfaceAfterVideoParameters: true,
         )
-      : const VideoControllerConfiguration(),
+      : const VideoControllerConfiguration(enableHardwareAcceleration: true),
 );
 
 /// A [Player] + [VideoController] pair created lazily by a video page's
@@ -178,10 +199,16 @@ class _VideoSession {
   /// on Android, reopens with `auto-safe` if mediacodec produced no frame.
   Future<void> watchFirstFrame(File file, {required bool Function() shouldPlay}) async {
     if (_disposed) return;
-    await _logHwdec();
-    if (!Platform.isAndroid) return;
+    if (!Platform.isAndroid) {
+      await _logHwdec();
+      return;
+    }
     try {
       await controller.waitUntilFirstFrameRendered.timeout(_firstFrameTimeout);
+      // Read after the decoder is up: right after open() mpv has not picked
+      // one yet and `hwdec-current` reads empty ("none") even when it will.
+      await Future<void>.delayed(const Duration(seconds: 1));
+      await _logHwdec();
     } on TimeoutException {
       if (_disposed) return;
       debugPrint('TVDIAG: video no first frame in ${_firstFrameTimeout.inSeconds}s, hwdec fallback auto-safe');
@@ -325,78 +352,144 @@ Widget _errorView({
   return Stack(fit: StackFit.expand, children: [preview, panel]);
 }
 
-/// The zoomable full-resolution photo shared by the cloud and local image
-/// pages. Decoded at 1x screen pixels, or 2x once [highRes] (the zoom passed
-/// its threshold). [placeholder] (the thumbnail) stays up until the first
-/// full-resolution frame is ready; after that it never comes back: changing
-/// `cacheWidth` resets Flutter's frame number to null, so without the
-/// `_shownFullRes` flag every pinch past the threshold flashed the blurry
-/// thumbnail again for the 200-500 ms the new decode took. `gaplessPlayback`
-/// keeps the previous frame on screen across the 1x -> 2x swap.
-Widget _zoomableImage(
-  BuildContext context, {
-  required File file,
+/// The zoomable photo shared by the cloud and local image pages: a
+/// `photo_view` [PhotoView] (pinch, pan, fling, scale bounds) driven by
+/// [zoom], with the progressive thumbnail -> full-resolution image inside it.
+///
+/// Zoomable from the first frame: while [file] is still null (downloading or
+/// being read) the [placeholder] thumbnail is what's inside the PhotoView, so
+/// it can already be pinched. The PhotoView's child size is fixed to the
+/// viewport (`childSize` left null), so its scale means "relative to fitted"
+/// whatever is decoded inside; when the full-resolution frame replaces the
+/// thumbnail, scale and position are left exactly where the user had them.
+///
+/// [PhotoViewGestureDetectorScope] (axis horizontal) is what fixes pinches
+/// that did not "catch": photo_view's recognizer then claims the gesture
+/// arena on the first move with two fingers down, before the PageView's
+/// horizontal drag can reach its slop, whatever the angle of the fingers.
+/// The same scope lets a one-finger horizontal drag through to the PageView
+/// when the photo cannot pan that way.
+///
+/// [loading] adds the progress ring over the photo (outside the PhotoView, so
+/// it never scales), tracking [progress] when given.
+///
+/// Public only so the gesture tests drive this exact configuration.
+@visibleForTesting
+Widget zoomablePhoto({
   required PhotoZoomController zoom,
+  required File? file,
   required bool highRes,
   Widget? placeholder,
+  bool loading = false,
+  ValueListenable<double>? progress,
 }) {
-  return _ZoomableImage(
-    file: file,
-    zoom: zoom,
-    highRes: highRes,
-    placeholder: placeholder,
+  final photo = LayoutBuilder(
+    builder: (context, constraints) {
+      zoom.viewportSize = constraints.biggest;
+      return PhotoViewGestureDetectorScope(
+        axis: Axis.horizontal,
+        child: PhotoView.customChild(
+          controller: zoom.view,
+          scaleStateController: zoom.scaleState,
+          // Double tap belongs to ViewerChromeHost -> zoom.toggleZoom.
+          scaleStateCycle: PhotoZoomController.noDoubleTapCycle,
+          minScale: PhotoZoomController.minScale,
+          maxScale: PhotoZoomController.maxScale,
+          backgroundDecoration: const BoxDecoration(color: Colors.transparent),
+          gestureDetectorBehavior: HitTestBehavior.opaque,
+          child: _ProgressiveImage(
+            file: file,
+            highRes: highRes,
+            placeholder: placeholder,
+          ),
+        ),
+      );
+    },
+  );
+  Widget? ring;
+  if (loading) {
+    ring = progress == null
+        ? _progressRing(0)
+        : ValueListenableBuilder<double>(
+            valueListenable: progress,
+            builder: (_, value, _) => _progressRing(value),
+          );
+  }
+  // Always this Stack, loading or not, so the PhotoView keeps its element
+  // (and its in-flight gesture) when the ring goes away.
+  return Stack(
+    fit: StackFit.expand,
+    children: [
+      photo,
+      if (ring != null)
+        IgnorePointer(
+          child: Align(
+            alignment: placeholder == null
+                ? Alignment.center
+                : const Alignment(0, 0.85),
+            child: ring,
+          ),
+        ),
+    ],
   );
 }
 
-class _ZoomableImage extends StatefulWidget {
-  const _ZoomableImage({
+/// The thumbnail, then the full-resolution photo once [file] is known and
+/// its first frame is decoded. Decoded at 1x screen pixels, or 2x once
+/// [highRes] (the zoom passed its threshold). [placeholder] stays up until
+/// the first full-resolution frame is ready; after that it never comes back:
+/// changing `cacheWidth` resets Flutter's frame number to null, so without
+/// the `_shownFullRes` flag every pinch past the threshold flashed the blurry
+/// thumbnail again for the 200-500 ms the new decode took. `gaplessPlayback`
+/// keeps the previous frame on screen across the 1x -> 2x swap.
+class _ProgressiveImage extends StatefulWidget {
+  const _ProgressiveImage({
     required this.file,
-    required this.zoom,
     required this.highRes,
     this.placeholder,
   });
-  final File file;
-  final PhotoZoomController zoom;
+  final File? file;
   final bool highRes;
   final Widget? placeholder;
 
   @override
-  State<_ZoomableImage> createState() => _ZoomableImageState();
+  State<_ProgressiveImage> createState() => _ProgressiveImageState();
 }
 
-class _ZoomableImageState extends State<_ZoomableImage> {
-  /// True once any full-resolution frame of [_ZoomableImage.file] has arrived.
+class _ProgressiveImageState extends State<_ProgressiveImage> {
+  /// True once any full-resolution frame of [_ProgressiveImage.file] has
+  /// arrived.
   bool _shownFullRes = false;
 
   @override
-  void didUpdateWidget(_ZoomableImage old) {
+  void didUpdateWidget(_ProgressiveImage old) {
     super.didUpdateWidget(old);
-    if (old.file.path != widget.file.path) _shownFullRes = false;
+    if (old.file?.path != widget.file?.path) _shownFullRes = false;
   }
 
   @override
   Widget build(BuildContext context) {
     final placeholder = widget.placeholder;
-    return InteractiveViewer(
-      transformationController: widget.zoom.transform,
-      minScale: 1,
-      maxScale: 5,
-      child: Center(
-        child: Image.file(
-          widget.file,
-          cacheWidth: photoDecodeWidth(context, highRes: widget.highRes),
-          filterQuality: FilterQuality.medium,
-          gaplessPlayback: true,
-          frameBuilder: placeholder == null
-              ? null
-              : (context, child, frame, wasSynchronouslyLoaded) {
-                  if (wasSynchronouslyLoaded || frame != null) {
-                    _shownFullRes = true;
-                    return child;
-                  }
-                  return _shownFullRes ? child : placeholder;
-                },
-          errorBuilder: (_, _, _) => const Text(
+    final file = widget.file;
+    if (file == null) return placeholder ?? const SizedBox.expand();
+    return SizedBox.expand(
+      child: Image.file(
+        file,
+        fit: BoxFit.contain,
+        cacheWidth: photoDecodeWidth(context, highRes: widget.highRes),
+        filterQuality: FilterQuality.medium,
+        gaplessPlayback: true,
+        frameBuilder: placeholder == null
+            ? null
+            : (context, child, frame, wasSynchronouslyLoaded) {
+                if (wasSynchronouslyLoaded || frame != null) {
+                  _shownFullRes = true;
+                  return child;
+                }
+                return _shownFullRes ? child : placeholder;
+              },
+        errorBuilder: (_, _, _) => const Center(
+          child: Text(
             'Could not display image.',
             style: TextStyle(color: Colors.white70),
           ),
@@ -458,11 +551,11 @@ class _CloudImagePageState extends ConsumerState<CloudImagePage>
   File? _local;
   bool _failed = false;
 
-  // Owns the transform, the "is zoomed" flag and the double-tap zoom
-  // animation. The flag has two jobs: InteractiveViewer's own pan/scale
-  // recognizer competes with the screen-level ViewerChromeHost's own
-  // gestures for the same pointer once zoomed in, and the enclosing PageView
-  // has to stop treating a horizontal pan as "next photo".
+  // Owns the PhotoView's controller, the "is zoomed" flag and the double-tap
+  // zoom animation. The flag has two jobs: the screen-level
+  // ViewerChromeHost's swipe/edge-tap handling stands down while zoomed (a
+  // one-finger drag is PhotoView's pan), and the enclosing PageView has to
+  // stop treating a horizontal pan as "next photo".
   late final PhotoZoomController _zoom = PhotoZoomController(this);
 
   void _reportZoom() => widget.zoomLock?.report(_zoom.zoomed.value);
@@ -503,7 +596,7 @@ class _CloudImagePageState extends ConsumerState<CloudImagePage>
       if (!mounted) return;
       setState(() => _local = file);
     } catch (e) {
-      debugPrint('TVDIAG: viewer cloud image load failed (${e.runtimeType})');
+      debugPrint('TVDIAG: viewer cloud image load failed (${_loadFailure(e)})');
       if (mounted) setState(() => _failed = true);
     }
   }
@@ -556,20 +649,16 @@ class _CloudImagePageState extends ConsumerState<CloudImagePage>
         localThumb: localThumb,
       );
     }
+    // Zoomable while still loading: the thumbnail can be pinched right away
+    // and the zoom carries over to the full-resolution frame.
     final local = _local;
-    if (local == null) {
-      return _loadingPreview(
-        cloudThumb: cloudThumb,
-        localThumb: localThumb,
-        progress: _progress,
-      );
-    }
-    return _zoomableImage(
-      context,
-      file: local,
+    return zoomablePhoto(
       zoom: _zoom,
+      file: local,
       highRes: _zoom.highRes.value,
       placeholder: _thumbPreview(cloudThumb: cloudThumb, localThumb: localThumb),
+      loading: local == null,
+      progress: _progress,
     );
   }
 }
@@ -664,7 +753,7 @@ class _CloudVideoPageState extends ConsumerState<CloudVideoPage> {
         session.watchFirstFrame(file, shouldPlay: () => mounted && widget.isCurrent),
       );
     } catch (e) {
-      debugPrint('TVDIAG: viewer cloud video load failed (${e.runtimeType})');
+      debugPrint('TVDIAG: viewer cloud video load failed (${_loadFailure(e)})');
       if (mounted) setState(() => _failed = true);
     }
   }
@@ -1031,13 +1120,13 @@ class _LocalImagePageState extends ConsumerState<LocalImagePage>
         localThumb: localThumb,
       );
     }
-    if (local == null) return _loadingPreview(localThumb: localThumb);
-    return _zoomableImage(
-      context,
-      file: local,
+    // Zoomable while still loading — see _CloudImagePageState.build.
+    return zoomablePhoto(
       zoom: _zoom,
+      file: local,
       highRes: _zoom.highRes.value,
       placeholder: _thumbPreview(localThumb: localThumb),
+      loading: local == null,
     );
   }
 }

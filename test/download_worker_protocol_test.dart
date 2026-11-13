@@ -67,6 +67,34 @@ void main() {
       expect(fake.worker.pendingCount, 0);
     });
 
+    test('a revocation error reply asks for the revocation probe; others do not', () async {
+      var checks = 0;
+      final previous = DownloadWorker.revocationCheck;
+      DownloadWorker.revocationCheck = () async {
+        checks++;
+        return false;
+      };
+      addTearDown(() => DownloadWorker.revocationCheck = previous);
+      final fake = _FakeWorker();
+      addTearDown(fake.close);
+
+      Future<void> failWith(String error) async {
+        final req = fake.nextRequest();
+        final future = fake.worker.runForTesting<int, void>(_boom, 0,
+            inactivityTimeout: const Duration(seconds: 5));
+        final msg = await req;
+        fake.worker.deliverForTesting({'id': msg['id'], 'error': error});
+        await expectLater(future, throwsA(isA<DownloadException>()));
+      }
+
+      await failWith('IndexException: AUTH_KEY_UNREGISTERED');
+      expect(checks, 1);
+      await failWith('SESSION_REVOKED');
+      expect(checks, 2);
+      await failWith('FLOOD_WAIT_5');
+      expect(checks, 2);
+    });
+
     test('error reply becomes DownloadException', () async {
       final fake = _FakeWorker();
       addTearDown(fake.close);

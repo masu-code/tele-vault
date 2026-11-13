@@ -23,6 +23,11 @@ class RegistryKeys {
   static const headlessRunMs = 'bk_headless_run_ms';
   static const headlessStatus = 'bk_headless_status';
 
+  /// Telegram user id the registry's links belong to (see
+  /// `BackupRegistry.bindAccount`). Deliberately not a `bk_` key: it is not
+  /// part of the legacy SharedPreferences layout.
+  static const account = 'tv_account';
+
   // Legacy-only keys (SharedPreferences).
   static const uploadedPrefix = 'bk_up_';
   static const linkPrefix = 'bk_link_';
@@ -80,6 +85,10 @@ typedef PendingIndexRow = ({
   String path,
 });
 
+/// A [PendingIndexRow] with the Telegram user id of the account that
+/// uploaded it (null for rows written before accounts were recorded).
+typedef TaggedPendingRow = ({PendingIndexRow row, int? account});
+
 abstract class RegistryStorage {
   Future<RegistrySnapshot> load();
 
@@ -103,9 +112,22 @@ abstract class RegistryStorage {
   /// Uploads waiting for their index write (see [PendingIndexRow]). Read
   /// straight from storage (not mirrored), so every isolate sees the rows the
   /// others wrote.
-  Future<void> addPendingIndex(PendingIndexRow row);
+  ///
+  /// [account] tags the row with the uploader's Telegram user id.
+  Future<void> addPendingIndex(PendingIndexRow row, {int? account});
   Future<List<PendingIndexRow>> pendingIndex();
+
+  /// Every pending row with its account tag.
+  Future<List<TaggedPendingRow>> pendingIndexTagged();
+
+  /// Tags the rows that have no account yet with [account].
+  Future<void> tagUntaggedPendingIndex(int account);
   Future<void> removePendingIndex(List<String> fileItemIds);
+
+  /// Removes every asset link, uploaded flag and local-path link (all
+  /// accounts' pending-index rows and the settings stay). Other isolates see
+  /// it as a deletion and reload fully.
+  Future<void> clearLinks();
 
   Future<void> close();
 }
@@ -298,9 +320,28 @@ class RegistryStore implements RegistryStorage {
     await db.execute('CREATE TABLE IF NOT EXISTS pending_index('
         'file_id TEXT PRIMARY KEY, asset_id TEXT NOT NULL, '
         'item_json TEXT NOT NULL, local_path TEXT NOT NULL, '
-        'created_ms INTEGER NOT NULL)');
+        'created_ms INTEGER NOT NULL, account INTEGER)');
     await db.execute('CREATE INDEX IF NOT EXISTS pending_index_asset '
         'ON pending_index(asset_id)');
+    // Tables created before accounts were recorded lack the column. Added in
+    // place (no version bump); an older build keeps working on it, since its
+    // statements name their columns.
+    // Two engines (the app and a WorkManager one) can open the database on
+    // the same first launch: both see the column missing and the second ALTER
+    // throws "duplicate column". Re-check the schema before giving up.
+    if (!await _hasAccountColumn(db)) {
+      try {
+        await db
+            .execute('ALTER TABLE pending_index ADD COLUMN account INTEGER');
+      } catch (_) {
+        if (!await _hasAccountColumn(db)) rethrow;
+      }
+    }
+  }
+
+  static Future<bool> _hasAccountColumn(Database db) async {
+    final cols = await db.rawQuery('PRAGMA table_info(pending_index)');
+    return cols.any((c) => c['name'] == 'account');
   }
 
   @override
@@ -432,17 +473,49 @@ class RegistryStore implements RegistryStorage {
   }
 
   @override
-  Future<void> addPendingIndex(PendingIndexRow row) => _db.rawInsert(
-      'INSERT OR REPLACE INTO pending_index'
-      '(file_id, asset_id, item_json, local_path, created_ms) '
-      'VALUES(?, ?, ?, ?, ?)',
-      [
-        row.fileItemId,
-        row.assetId,
-        row.itemJson,
-        row.path,
-        DateTime.now().millisecondsSinceEpoch,
-      ]);
+  Future<void> addPendingIndex(PendingIndexRow row, {int? account}) =>
+      _db.rawInsert(
+          'INSERT OR REPLACE INTO pending_index'
+          '(file_id, asset_id, item_json, local_path, created_ms, account) '
+          'VALUES(?, ?, ?, ?, ?, ?)',
+          [
+            row.fileItemId,
+            row.assetId,
+            row.itemJson,
+            row.path,
+            DateTime.now().millisecondsSinceEpoch,
+            account,
+          ]);
+
+  @override
+  Future<List<TaggedPendingRow>> pendingIndexTagged() async {
+    final rows = await _db.rawQuery(
+        'SELECT file_id, asset_id, item_json, local_path, account '
+        'FROM pending_index ORDER BY created_ms, rowid');
+    return [
+      for (final r in rows)
+        (
+          row: (
+            assetId: r['asset_id'] as String,
+            fileItemId: r['file_id'] as String,
+            itemJson: r['item_json'] as String,
+            path: r['local_path'] as String,
+          ),
+          account: r['account'] as int?,
+        ),
+    ];
+  }
+
+  @override
+  Future<void> tagUntaggedPendingIndex(int account) => _db.rawUpdate(
+      'UPDATE pending_index SET account = ? WHERE account IS NULL', [account]);
+
+  @override
+  Future<void> clearLinks() => _write((txn, rev) async {
+        final delLinks = await txn.rawDelete('DELETE FROM links');
+        final delPaths = await txn.rawDelete('DELETE FROM paths');
+        if (delLinks > 0 || delPaths > 0) rev.markDeleted();
+      });
 
   @override
   Future<List<PendingIndexRow>> pendingIndex() async {
@@ -748,6 +821,8 @@ class PrefsRegistryStorage implements RegistryStorage {
         if (v is String) snap.kv[key] = v;
       }
     }
+    final account = _prefs.get(RegistryKeys.account);
+    if (account is String) snap.kv[RegistryKeys.account] = account;
     for (final a in {...uploaded, ...items.keys}) {
       snap.links.add(LinkRow(a, items[a], uploaded.contains(a)));
     }
@@ -807,7 +882,7 @@ class PrefsRegistryStorage implements RegistryStorage {
   /// the legacy parse/cleanup never touches it.
   static const _pendingIndexKey = 'tv_pending_index';
 
-  Future<List<PendingIndexRow>> _readPending() async {
+  Future<List<TaggedPendingRow>> _readPending() async {
     try {
       await _prefs.reload();
     } catch (_) {}
@@ -817,10 +892,13 @@ class PrefsRegistryStorage implements RegistryStorage {
       return [
         for (final e in (jsonDecode(raw) as List).cast<Map<String, dynamic>>())
           (
-            assetId: e['a'] as String,
-            fileItemId: e['f'] as String,
-            itemJson: e['j'] as String,
-            path: e['p'] as String,
+            row: (
+              assetId: e['a'] as String,
+              fileItemId: e['f'] as String,
+              itemJson: e['j'] as String,
+              path: e['p'] as String,
+            ),
+            account: e['u'] as int?,
           ),
       ];
     } catch (_) {
@@ -828,30 +906,61 @@ class PrefsRegistryStorage implements RegistryStorage {
     }
   }
 
-  Future<void> _writePending(List<PendingIndexRow> rows) => _prefs.setString(
+  Future<void> _writePending(List<TaggedPendingRow> rows) => _prefs.setString(
       _pendingIndexKey,
       jsonEncode([
         for (final r in rows)
-          {'a': r.assetId, 'f': r.fileItemId, 'j': r.itemJson, 'p': r.path},
+          {
+            'a': r.row.assetId,
+            'f': r.row.fileItemId,
+            'j': r.row.itemJson,
+            'p': r.row.path,
+            if (r.account != null) 'u': r.account,
+          },
       ]));
 
   @override
-  Future<void> addPendingIndex(PendingIndexRow row) async {
+  Future<void> addPendingIndex(PendingIndexRow row, {int? account}) async {
     final rows = await _readPending();
-    rows.removeWhere((r) => r.fileItemId == row.fileItemId);
-    rows.add(row);
+    rows.removeWhere((r) => r.row.fileItemId == row.fileItemId);
+    rows.add((row: row, account: account));
     await _writePending(rows);
   }
 
   @override
-  Future<List<PendingIndexRow>> pendingIndex() => _readPending();
+  Future<List<PendingIndexRow>> pendingIndex() async =>
+      [for (final r in await _readPending()) r.row];
+
+  @override
+  Future<List<TaggedPendingRow>> pendingIndexTagged() => _readPending();
+
+  @override
+  Future<void> tagUntaggedPendingIndex(int account) async {
+    final rows = await _readPending();
+    if (rows.every((r) => r.account != null)) return;
+    await _writePending([
+      for (final r in rows) (row: r.row, account: r.account ?? account),
+    ]);
+  }
+
+  @override
+  Future<void> clearLinks() async {
+    for (final key in _prefs.getKeys().toList()) {
+      if (key.startsWith(RegistryKeys.uploadedPrefix) ||
+          key.startsWith(RegistryKeys.linkPrefix) ||
+          key.startsWith(RegistryKeys.fileItemPrefix) ||
+          key.startsWith(RegistryKeys.assetForFileItemPrefix)) {
+        await _prefs.remove(key);
+      }
+    }
+  }
 
   @override
   Future<void> removePendingIndex(List<String> fileItemIds) async {
     if (fileItemIds.isEmpty) return;
     final ids = fileItemIds.toSet();
     final rows = await _readPending();
-    rows.removeWhere((r) => ids.contains(r.fileItemId));
+    rows.removeWhere((r) => ids.contains(r.row.fileItemId));
     await _writePending(rows);
   }
 

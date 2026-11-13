@@ -373,6 +373,7 @@ class BackfillRunResult {
     required this.needsDesktop,
     required this.failures,
     required this.paused,
+    this.more = false,
   });
 
   final int produced;
@@ -383,4 +384,7 @@ class BackfillRunResult {
   /// id -> failure (ids and mime types only).
   final Map<String, BackfillFailure> failures;
   final bool paused;
+
+  /// A chunked run (`maxCandidates`) left candidates for a later run.
+  final bool more;
 }

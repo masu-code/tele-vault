@@ -7,6 +7,13 @@ import 'package:tg/tg.dart' as tg;
 import '../../../core/api_credentials_service.dart';
 import '../../../core/telegram/client.dart';
 import '../../../core/telegram/io_socket.dart';
+import '../session_cleanup.dart';
+import 'session_cleanup_provider.dart';
+
+/// Shown on the login screen after the server ended the session (logged out
+/// from another device, terminated in Telegram's settings).
+const sessionRevokedMessage =
+    'Your session was closed from another device. Please sign in again.';
 
 enum AuthStep { initial, waitingCode, waitingPassword, authenticated }
 
@@ -69,14 +76,74 @@ class AuthState {
 }
 
 class AuthNotifier extends StateNotifier<AuthState> {
-  AuthNotifier() : super(const AuthState()) {
+  AuthNotifier({SessionCleanup? cleanup})
+      : _cleanup = cleanup ?? SessionCleanup.minimal(),
+        super(const AuthState()) {
+    _listenForRevocation();
     _init();
   }
 
   /// Test-only: starts at [initial] and skips the cold-start session restore,
   /// so widget tests can drive the auth state without touching the network.
   @visibleForTesting
-  AuthNotifier.withoutRestore(AuthState initial) : super(initial);
+  AuthNotifier.withoutRestore(AuthState initial, {SessionCleanup? cleanup})
+      : _cleanup = cleanup ?? SessionCleanup.minimal(),
+        super(initial) {
+    _listenForRevocation();
+  }
+
+  final SessionCleanup _cleanup;
+
+  /// Central revocation handling: [TelegramService] confirms (with a probe)
+  /// that the server dropped the session and calls back here.
+  void _listenForRevocation() {
+    TelegramService.instance.onSessionRevoked = _onSessionRevoked;
+  }
+
+  @override
+  void dispose() {
+    if (TelegramService.instance.onSessionRevoked == _onSessionRevoked) {
+      TelegramService.instance.onSessionRevoked = null;
+    }
+    super.dispose();
+  }
+
+  /// The teardown in progress, if any: log out, a revocation and the queue's
+  /// own report of a dead session can overlap, and must run once.
+  Future<void>? _teardown;
+
+  /// The user chose "Log out": ends the session on the server (best effort),
+  /// drops it from the device, clears the account's local state and returns to
+  /// the login screen. The backup registry is kept (see [SessionCleanup]).
+  Future<void> logOut() => _leaveSession(serverSide: true);
+
+  /// A revocation [TelegramService] confirmed: the same local cleanup as
+  /// [logOut] without the `auth.logOut` RPC (the server already did it), and
+  /// the login screen says why.
+  Future<void> _onSessionRevoked() async {
+    // Not signed in (cold-start restore, which handles a dead key itself, or
+    // already on the login screen): nothing to leave.
+    if (!state.isAuthenticated) return;
+    await _leaveSession(serverSide: false, notice: sessionRevokedMessage);
+  }
+
+  Future<void> _leaveSession({required bool serverSide, String? notice}) {
+    final inFlight = _teardown;
+    if (inFlight != null) return inFlight;
+    final run = () async {
+      await _cleanup.run(serverSide: serverSide);
+      // restoring:false is what lets the app show the login screen: the
+      // default (true) is the cold-start splash.
+      if (mounted) {
+        state = AuthState(step: AuthStep.initial, restoring: false, error: notice);
+      }
+    }();
+    _teardown = run;
+    run.whenComplete(() {
+      if (identical(_teardown, run)) _teardown = null;
+    }).ignore();
+    return run;
+  }
 
   /// Test-only: pushes an arbitrary state through, for driving the screens
   /// that react to it.
@@ -144,10 +211,13 @@ class AuthNotifier extends StateNotifier<AuthState> {
         // account" with nothing explaining why or offering a way out. One
         // cheap authenticated call here turns that into an honest
         // "sign in again".
-        final alive = await _sessionIsAlive();
+        final probe = await _sessionIsAlive();
+        final alive = probe.alive;
         debugPrint('TVAUTH: _init sessionAlive=$alive');
         if (alive == false) {
-          await TelegramService.instance.clearSession();
+          // The same local cleanup as a revocation while the app is open
+          // (session, index cache, workers), without the log-out RPC.
+          await _cleanup.run(serverSide: false);
           state = const AuthState(
             step: AuthStep.initial,
             error: 'Your Telegram session expired. Please sign in again.',
@@ -155,6 +225,10 @@ class AuthNotifier extends StateNotifier<AuthState> {
           return;
         }
 
+        // Records which account the backup registry belongs to (first run of
+        // this build) or notices a different one. Best effort: unknown here
+        // means the session continues as the account it already was.
+        await _bindAccount(probe.userId);
         state = state.copyWith(step: AuthStep.authenticated, isLoading: false);
         return;
       } catch (e) {
@@ -188,19 +262,58 @@ class AuthNotifier extends StateNotifier<AuthState> {
   /// authenticated request. `true` = the server accepted it, `false` = the
   /// server rejected the key itself, `null` = couldn't tell (network
   /// problem, rate limit, …), which must NOT be treated as a dead session.
-  Future<bool?> _sessionIsAlive() async {
+  /// [userId] is the Telegram user id when the server answered.
+  Future<({bool? alive, int? userId})> _sessionIsAlive() async {
     try {
       final result = await TelegramService.instance
           .call((c) => c.users.getFullUser(id: const t.InputUserSelf()))
           .timeout(const Duration(seconds: 20));
       final message = result.error?.errorMessage;
-      if (message == null) return true;
-      if (_deadSessionErrors.any(message.startsWith)) return false;
-      return null;
+      if (message == null) {
+        final full = result.result;
+        final user = full is t.UsersUserFull ? full.fullUser : null;
+        return (alive: true, userId: user is t.UserFull ? user.id : null);
+      }
+      if (_deadSessionErrors.any(message.startsWith)) {
+        return (alive: false, userId: null);
+      }
+      return (alive: null, userId: null);
     } catch (e) {
-      debugPrint('TVAUTH: _sessionIsAlive inconclusive: $e');
-      return null;
+      debugPrint('TVAUTH: _sessionIsAlive inconclusive: ${e.runtimeType}');
+      return (alive: null, userId: null);
     }
+  }
+
+  /// Ties the backup registry to the logged-in account (see
+  /// [SessionCleanup.bindAccount]). A failure is logged and ignored.
+  Future<void> _bindAccount(int? userId) async {
+    if (userId == null) return;
+    try {
+      await _cleanup.bindAccount(userId);
+    } catch (e) {
+      debugPrint('TVAUTH: registry account bind failed (${e.runtimeType})');
+    }
+  }
+
+  /// The Telegram user id of a successful sign-in result, if it carries one.
+  static int? _userIdOf(t.AuthAuthorizationBase? authorization) {
+    if (authorization is! t.AuthAuthorization) return null;
+    final user = authorization.user;
+    return user is t.User ? user.id : null;
+  }
+
+  /// A fresh login succeeded: saves the session, binds the registry to the
+  /// account (before any upload starts) and schedules the background backup
+  /// that log out cancelled.
+  Future<void> _finishLogin(t.AuthAuthorizationBase? authorization) async {
+    await TelegramService.instance.saveSession();
+    await _bindAccount(_userIdOf(authorization));
+    try {
+      await _cleanup.resumeBackgroundTasks();
+    } catch (e) {
+      debugPrint('TVAUTH: background backup not scheduled (${e.runtimeType})');
+    }
+    state = state.copyWith(step: AuthStep.authenticated, isLoading: false);
   }
 
   /// How long to wait for one auth request before giving up on it. Generous
@@ -256,10 +369,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
   /// saved session and drops back to the phone-number screen so the user
   /// sees they need to log in again, instead of the app silently retrying a
   /// dead key forever in the background.
-  Future<void> invalidateSession() async {
-    await TelegramService.instance.clearSession();
-    state = const AuthState(step: AuthStep.initial);
-  }
+  Future<void> invalidateSession() => _leaveSession(serverSide: false);
 
   String _friendlyError(Object e) {
     if (e is TimeoutException ||
@@ -441,8 +551,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
         return;
       }
 
-      await TelegramService.instance.saveSession();
-      state = state.copyWith(step: AuthStep.authenticated, isLoading: false);
+      await _finishLogin(result.result);
     } catch (e) {
       state = state.copyWith(isLoading: false, error: _friendlyError(e));
     }
@@ -485,9 +594,8 @@ class AuthNotifier extends StateNotifier<AuthState> {
         return;
       }
 
-      await TelegramService.instance.saveSession();
+      await _finishLogin(result.result);
       debugPrint('TVAUTH: checkPassword SUCCESS, authenticated');
-      state = state.copyWith(step: AuthStep.authenticated, isLoading: false);
     } catch (e, st) {
       debugPrint('TVAUTH: checkPassword EXCEPTION: $e\n$st');
       state = state.copyWith(isLoading: false, error: _friendlyError(e));
@@ -496,5 +604,5 @@ class AuthNotifier extends StateNotifier<AuthState> {
 }
 
 final authProvider = StateNotifierProvider<AuthNotifier, AuthState>(
-  (_) => AuthNotifier(),
+  (ref) => AuthNotifier(cleanup: ref.read(sessionCleanupProvider)),
 );

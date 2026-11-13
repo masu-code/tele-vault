@@ -29,6 +29,15 @@ abstract final class WorkerProgress {
 
   static Future<R> _runWith<R>(void Function(Object) sink, Future<R> Function() body) =>
       runZoned(body, zoneValues: {_zoneKey: sink});
+
+  /// Runs [body] with [report] receiving the [WorkerProgress.report] calls
+  /// made inside it — the FLOOD_WAIT wait in `TelegramService.call` makes one
+  /// every 10 s. Used by downloads so a flood wait counts as alive.
+  static Future<R> runReporting<R>(
+    void Function(Object progress) report,
+    Future<R> Function() body,
+  ) =>
+      _runWith<R>(report, body);
 }
 
 /// Runs [start] and fails with `DownloadException('timeout')` when it neither
@@ -48,7 +57,7 @@ Future<T> withInactivityTimeout<T>(
     timer = Timer(timeout, () {
       if (out.isCompleted) return;
       onTimeout?.call();
-      out.completeError(DownloadException('timeout'));
+      out.completeError(DownloadException('timeout', stage: 'inactivity', code: 'TIMEOUT'));
     });
   }
 
@@ -195,6 +204,14 @@ class DownloadWorker {
   /// progress per chunk, so only a genuinely stalled request trips it.
   static Duration defaultInactivityTimeout = const Duration(seconds: 60);
 
+  /// The inactivity timeout of full-file requests ('cache', 'file'). Longer
+  /// than [defaultInactivityTimeout] because one `TelegramService.call` can
+  /// legitimately go ~2 min without a byte (idle probe, reconnect, 30 s RPC
+  /// inactivity, reconnect, retry) on the first window of a big file over a
+  /// stale connection — the 60 s guard used to fail that first open while
+  /// the worker went on to finish the file, so the second open played.
+  static Duration transferInactivityTimeout = const Duration(seconds: 150);
+
   /// Covers spawning the isolate and getting its port back — not the session
   /// restore, which each request waits for on the worker side. A spawn that
   /// never completes would otherwise hang every download forever.
@@ -217,6 +234,10 @@ class DownloadWorker {
   /// Simulates the worker isolate dying (tests).
   @visibleForTesting
   void exitForTesting() => _onWorkerExit();
+
+  /// Log out: tells the worker isolate to drop its connection and session
+  /// key (it holds its own copy). No-op when it was never started.
+  void resetSession() => _sendPort?.send({'type': 'reset'});
 
   Future<SendPort> _ensureStarted() {
     final ready = _sendPort;
@@ -325,9 +346,29 @@ class DownloadWorker {
       },
     );
     final error = reply['error'] as String?;
-    if (error != null) throw DownloadException(error);
+    if (error != null) {
+      // Index loads, downloads and thumbnails run here, so a session killed
+      // while the user only browses is seen through these failures (the main
+      // isolate's own calls never fail). Only a hint: the probe decides.
+      if (mentionsRevocation(error)) {
+        unawaited(revocationCheck().catchError((Object _) => false));
+      }
+      throw DownloadException(
+        error,
+        stage: reply['stage'] as String? ?? 'worker',
+        code: reply['code'] as String?,
+        part: reply['part'] as String?,
+      );
+    }
     return reply;
   }
+
+  /// Runs when a worker request failed with a revocation error; the
+  /// production check is [TelegramService.confirmRevocation], which probes
+  /// and does nothing on a transient error.
+  @visibleForTesting
+  static Future<bool> Function() revocationCheck =
+      () => TelegramService.instance.confirmRevocation();
 
   /// Runs the top-level/static function [topLevelFn] with [arg] on the worker
   /// isolate (after its Telegram session is restored) and returns its result.
@@ -389,7 +430,8 @@ class DownloadWorker {
   }) async {
     final reply = await _request(
       {'type': 'cache', 'item': item.toJson()},
-      onProgress: onProgress == null ? null : (v) => onProgress(v as double),
+      onProgress: onProgress == null ? null : (v) => onProgress((v as num).toDouble()),
+      inactivityTimeout: transferInactivityTimeout,
     );
     return reply['path'] as String;
   }
@@ -402,7 +444,8 @@ class DownloadWorker {
   }) async {
     final reply = await _request(
       {'type': 'file', 'item': item.toJson(), 'destDir': destDir},
-      onProgress: onProgress == null ? null : (v) => onProgress(v as double),
+      onProgress: onProgress == null ? null : (v) => onProgress((v as num).toDouble()),
+      inactivityTimeout: transferInactivityTimeout,
     );
     return reply['path'] as String;
   }
@@ -424,7 +467,15 @@ void _entry(_IsolateInit init) {
   final port = ReceivePort();
   init.sendPort.send(port.sendPort);
   port.listen((raw) {
-    unawaited(_handle((raw as Map).cast<String, dynamic>(), init.sendPort));
+    final msg = (raw as Map).cast<String, dynamic>();
+    if (msg['type'] == 'reset') {
+      // Log out: forget the connection and key; the next request re-reads
+      // the saved session (the next account's, or none).
+      _session = null;
+      unawaited(TelegramService.instance.dropConnection());
+      return;
+    }
+    unawaited(_handle(msg, init.sendPort));
   });
 }
 
@@ -521,8 +572,17 @@ Future<void> _handle(
       await TelegramService.instance.dropConnection();
     }
     // Plain message (not "DownloadException: ...") — the main side wraps it
-    // in a DownloadException again.
-    reply.send({'id': id, 'error': e is DownloadException ? e.message : e.toString()});
+    // in a DownloadException again, with the safe stage/code/part fields.
+    reply.send({
+      'id': id,
+      'error': e is DownloadException ? e.message : e.toString(),
+      if (e is DownloadException) ...{
+        if (e.stage != null) 'stage': e.stage,
+        if (e.code != null) 'code': e.code,
+        if (e.part != null) 'part': e.part,
+      } else
+        'code': '${e.runtimeType}',
+    });
   } finally {
     // Nothing may be sent after the final reply (late timer, a `fn` that
     // keeps reporting after it returned).

@@ -1,7 +1,5 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
-import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
@@ -22,14 +20,17 @@ import '../telegram/tg_utils.dart';
 import '../upload/upload_plan.dart' show UploadLimits;
 import 'backfill_state.dart';
 import 'pack_installer.dart';
+import 'pack_publisher.dart';
 import 'preview_table.dart';
 import 'server_thumb_batch.dart';
 import 'thumb_encoder.dart';
-import 'thumb_prefetcher.dart' show ThumbPrefetcher, defaultPreviewFromJpeg;
+import 'thumb_prefetcher.dart' show defaultPreviewFromJpeg;
 import 'thumb_store.dart';
 
+export 'pack_publisher.dart' show BackfillException, BackfillIndexAccess, PackRemote;
+
 /// Data bytes per pack the job aims for (the format allows 8 MiB).
-const int kBackfillPackDataBytes = 7 * 1024 * 1024 + 512 * 1024;
+const int kBackfillPackDataBytes = kPackDataBytes;
 
 /// Longest side of a thumbnail the job makes from an original.
 const int kBackfillThumbSide = 320;
@@ -43,28 +44,7 @@ class BackfillBlockedException implements Exception {
   String toString() => message;
 }
 
-/// The job failed part-way; its state file lets the next run resume.
-class BackfillException implements Exception {
-  const BackfillException(this.message);
-  final String message;
-  @override
-  String toString() => message;
-}
-
 // ------------------------------------------------------------------- seams
-
-/// The app's index as the job sees it.
-abstract class BackfillIndexAccess {
-  /// The index as currently loaded and saved, or null when it is loading,
-  /// saving, stale or failed (the job then does nothing to it).
-  FileIndex? current();
-
-  /// Applies [mutate] to the freshest index, saves it through
-  /// `IndexService.save` and returns the index that was actually written.
-  /// When [mutate] returns its argument unchanged (identical), nothing is
-  /// written and that index is returned.
-  Future<FileIndex> write(FileIndex Function(FileIndex current) mutate);
-}
 
 /// What the job learns about a candidate's first Telegram message without
 /// downloading anything.
@@ -91,20 +71,13 @@ class BackfillOriginal {
 /// Telegram access used by the job. The only writes are [uploadPack]
 /// (`saveFilePart` + `sendMedia` of a pack document); the index is written
 /// through [BackfillIndexAccess].
-abstract class BackfillRemote {
+abstract class BackfillRemote implements PackRemote {
   Future<List<BackfillProbe>> probe(List<int> messageIds);
   Future<List<ServerThumbResult>> serverThumbs(List<ServerThumbTarget> targets);
 
   /// Downloads (or finds locally) [item]'s original. [workDir] is the item's
   /// own scratch directory.
   Future<BackfillOriginal> fetchOriginal(FileItem item, String workDir);
-
-  /// Sends the pack file at [path] as a document captioned
-  /// `TELEVAULT_THUMBS_V1 <packId>`; returns its message id.
-  Future<int> uploadPack(String path, String packId);
-
-  /// The pack message with caption id [packId], if one is in Saved Messages.
-  Future<ThumbPackRef?> findPack(String packId);
 
   Future<PackInstallResult> installPack(PackInstallArgs args);
 }
@@ -181,7 +154,18 @@ class BackfillService {
         _networkAllowed = networkAllowed ?? _unmeteredNetwork,
         _requireUnmetered = requireUnmetered ?? Platform.isAndroid,
         _now = now ?? DateTime.now,
-        _newPackId = newPackId ?? const Uuid().v4;
+        _newPackId = newPackId ?? const Uuid().v4 {
+    _publisher = PackPublisher(
+      index: _indexAccess,
+      remote: _remote,
+      store: _store,
+      previews: _previews,
+      stateStore: _stateStore,
+      workDir: _workDir,
+      onPackApplied: onPackApplied,
+      log: _log,
+    );
+  }
 
   final BackfillIndexAccess _indexAccess;
   final BackfillRemote _remote;
@@ -194,6 +178,10 @@ class BackfillService {
   final bool _requireUnmetered;
   final DateTime Function() _now;
   final String Function() _newPackId;
+
+  /// Pack building, upload, index commit and bookkeeping (shared with the
+  /// automatic packer).
+  late final PackPublisher _publisher;
 
   /// Tells the prefetcher a pack is applied on this device, so it does not
   /// download one the backfill just produced or installed. Defaults to
@@ -306,7 +294,11 @@ class BackfillService {
 
   // ----------------------------------------------------------------- run
 
-  Future<BackfillRunResult> run() async {
+  /// Runs the job. With [maxCandidates], works on at most that many
+  /// candidates (a small resumable chunk) and only uploads full packs, unless
+  /// this chunk reaches the last candidate; [BackfillRunResult.more] then
+  /// says whether candidates are left for a later chunk.
+  Future<BackfillRunResult> run({int? maxCandidates}) async {
     if (_busy) throw const BackfillBlockedException('The backfill job is already running.');
     _busy = true;
     _pauseRequested = false;
@@ -329,7 +321,8 @@ class BackfillService {
 
       final ffmpeg = await _codec.ffmpegAvailable();
       final scan = _scan(_indexAccess.current() ?? index, s, ffmpeg: ffmpeg);
-      final candidates = scan.candidates;
+      final limited = maxCandidates != null && scan.candidates.length > maxCandidates;
+      final candidates = limited ? scan.candidates.sublist(0, maxCandidates) : scan.candidates;
       _set(_progress.value.copyWith(
         phase: BackfillPhase.serverThumbs,
         total: candidates.length,
@@ -378,7 +371,7 @@ class BackfillService {
       var patched = 0;
       if (!paused) {
         _set(_progress.value.copyWith(phase: BackfillPhase.packing));
-        await _flush(s, all: true);
+        await _flush(s, all: !limited);
         _throwIfAborted();
         _set(_progress.value.copyWith(phase: BackfillPhase.patching));
         patched = await _patch(s, covered);
@@ -393,6 +386,7 @@ class BackfillService {
         needsDesktop: s.needsDesktop.length,
         failures: Map.unmodifiable(s.failed),
         paused: paused,
+        more: limited,
       );
       _log('run ${s.lastResult} produced=${result.produced} packs=${result.packsUploaded} '
           'patched=$patched desktop=${result.needsDesktop} failed=${s.failed.length}');
@@ -600,98 +594,11 @@ class BackfillService {
     return ids;
   }
 
-  /// Uploads (or finds) the pending pack, records it in the index and in
-  /// `_packs_applied.json`, then marks its ids packed. Each step is
-  /// persisted before the next, so any interruption resumes here.
-  Future<void> _completePending(BackfillState s) async {
-    final pend = s.pending!;
-    if (pend.messageId == null) {
-      ThumbPackRef? found;
-      if (pend.uploadStarted) found = await _remote.findPack(pend.packId);
-      if (found != null) {
-        pend.messageId = found.messageId;
-        pend.size = found.size;
-      } else {
-        final built = await _buildPack(pend);
-        if (built == null) {
-          s.pending = null;
-          await _stateStore.save(s);
-          return;
-        }
-        pend.uploadStarted = true;
-        await _stateStore.save(s);
-        try {
-          pend.messageId = await _remote.uploadPack(built.path, pend.packId);
-        } finally {
-          try {
-            await File(built.path).delete();
-          } catch (_) {}
-        }
-        pend.size = built.size;
-      }
-      await _stateStore.save(s);
-      _set(_progress.value.copyWith(packsUploaded: _progress.value.packsUploaded + 1));
-      _log('pack uploaded entries=${pend.ids.length} size=${pend.size}');
-    }
-    final ref = pend.ref!;
-    await _commitToIndex(ref, pend.ids);
-    await _recordApplied(ref);
-    s.packed.addAll(pend.ids);
-    s.packs
-      ..removeWhere((r) => r.messageId == ref.messageId)
-      ..add(ref);
-    s.pending = null;
-    await _stateStore.save(s);
-  }
-
-  /// Writes the pending pack's file from the ThumbStore (off the UI
-  /// isolate). Ids whose thumbnail is gone or damaged leave the pack and are
-  /// dropped from the store, so they become candidates again.
-  Future<({String path, int size})?> _buildPack(PendingPack pend) async {
-    final dir = await _store.dirPath();
-    final work = await _workDir();
-    await work.create(recursive: true);
-    final out = p.join(work.path, '${ThumbPackCodec.fileNameFor(pend.packId)}.tmp');
-    final rows = <_PackRow>[
-      for (final id in pend.ids)
-        (id, p.join(dir, '$id.jpg'), _wireFor(id)),
-    ];
-    final built = await _writePackFileOffThread(pend.packId, pend.createdAt, rows, out);
-    for (final id in built.bad) {
-      await _store.reportCorrupt(id);
-    }
-    if (built.ids.isEmpty) {
-      try {
-        await File(out).delete();
-      } catch (_) {}
-      return null;
-    }
-    pend.ids = built.ids;
-    return (path: out, size: built.size);
-  }
-
-  String? _wireFor(String id) {
-    final h = _previews.hash(id);
-    return h == null ? null : PreviewCodec.toWire(h);
-  }
-
-  Future<void> _commitToIndex(ThumbPackRef ref, List<String> ids) async {
-    final previews = <String, String>{};
-    for (final id in ids) {
-      final w = _wireFor(id);
-      if (w != null) previews[id] = w;
-    }
-    bool hasPack(FileIndex i) => i.thumbPacks.any((r) => r.messageId == ref.messageId);
-    final cur = _indexAccess.current();
-    if (cur != null && hasPack(cur) && identical(cur.withPreviews(previews), cur)) return;
-    final written = await _indexAccess.write((i) {
-      final withPack = hasPack(i) ? i : i.addThumbPack(ref);
-      return withPack.withPreviews(previews);
-    });
-    if (!hasPack(written)) {
-      throw const BackfillException('The index write did not keep the new pack; run again.');
-    }
-  }
+  Future<void> _completePending(BackfillState s) => _publisher.completePending(
+        s,
+        onUploaded: () =>
+            _set(_progress.value.copyWith(packsUploaded: _progress.value.packsUploaded + 1)),
+      );
 
   /// Packs listed in the index that this device has not applied are
   /// installed first (their thumbnails are not candidates). Returns the ids
@@ -768,45 +675,11 @@ class BackfillService {
 
   // -------------------------------------------------------- bookkeeping
 
-  /// `_packs_applied.json` in the thumbnail directory (shared with the
-  /// prefetcher): merged, never replaced wholesale.
-  Future<File> _appliedFile() async => File(p.join(await _store.dirPath(), '_packs_applied.json'));
+  Future<Map<String, String>> _readApplied() => _publisher.readApplied();
 
-  Future<Map<String, String>> _readApplied() async {
-    final out = <String, String>{};
-    try {
-      final file = await _appliedFile();
-      if (!await file.exists()) return out;
-      final doc = jsonDecode(await file.readAsString());
-      if (doc is Map && doc['v'] == 1 && doc['packs'] is Map) {
-        (doc['packs'] as Map).forEach((k, v) {
-          if (k is String && v is String) out[k] = v;
-        });
-      }
-    } catch (_) {
-      // Unreadable: packs are reinstalled (idempotent).
-    }
-    return out;
-  }
+  Future<void> _recordApplied(ThumbPackRef ref) => _publisher.recordApplied(ref);
 
-  Future<void> _recordApplied(ThumbPackRef ref) async {
-    try {
-      (onPackApplied ?? ThumbPrefetcher.instance.markPackApplied)(ref.id, ref.messageId);
-    } catch (_) {
-      // In-memory hint only.
-    }
-    try {
-      final applied = await _readApplied();
-      if (applied['${ref.messageId}'] == ref.id) return;
-      applied['${ref.messageId}'] = ref.id;
-      final file = await _appliedFile();
-      final tmp = File('${file.path}.backfill.tmp');
-      await tmp.writeAsString(jsonEncode({'v': 1, 'packs': applied}), flush: true);
-      await tmp.rename(file.path);
-    } catch (_) {
-      // Not fatal: the pack is reinstalled later (idempotent).
-    }
-  }
+  String? _wireFor(String id) => _publisher.wireFor(id);
 
   void _fail(BackfillState s, FileItem f, String reason) {
     final old = s.failed[f.id];
@@ -972,55 +845,6 @@ class BackfillService {
       return false;
     }
   }
-}
-
-typedef _PackRow = (String id, String path, String? preview);
-typedef _BuiltPack = ({List<String> ids, List<String> bad, int size});
-
-/// Top-level so the closure handed to `Isolate.run` captures only its
-/// arguments.
-Future<_BuiltPack> _writePackFileOffThread(
-  String packId,
-  DateTime createdAt,
-  List<_PackRow> rows,
-  String outPath,
-) =>
-    Isolate.run(() => _writePackFile(packId, createdAt, rows, outPath));
-
-/// Runs on a helper isolate: reads each thumbnail, validates it and writes
-/// the TVTP file to [outPath].
-Future<_BuiltPack> _writePackFile(
-  String packId,
-  DateTime createdAt,
-  List<_PackRow> rows,
-  String outPath,
-) async {
-  final entries = <ThumbPackEntry>[];
-  final bad = <String>[];
-  for (final (id, path, preview) in rows) {
-    try {
-      final file = File(path);
-      if (!file.existsSync()) {
-        bad.add(id);
-        continue;
-      }
-      final jpeg = file.readAsBytesSync();
-      final size = jpegSize(jpeg);
-      if (!looksLikeJpeg(jpeg) || jpeg.length > ThumbPackCodec.maxBlobBytes || size == null ||
-          size.w < 1 || size.h < 1) {
-        bad.add(id);
-        continue;
-      }
-      final validPreview = preview != null && PreviewCodec.fromWire(preview) != null ? preview : null;
-      entries.add(ThumbPackEntry(id: id, jpeg: jpeg, width: size.w, height: size.h, preview: validPreview));
-    } catch (_) {
-      bad.add(id);
-    }
-  }
-  if (entries.isEmpty) return (ids: const <String>[], bad: bad, size: 0);
-  final bytes = ThumbPackCodec.encode(packId: packId, createdAt: createdAt, entries: entries);
-  File(outPath).writeAsBytesSync(bytes, flush: true);
-  return (ids: [for (final e in entries) e.id], bad: bad, size: bytes.length);
 }
 
 // ---------------------------------------------------------- defaults: remote
